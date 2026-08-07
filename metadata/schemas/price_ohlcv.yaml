@@ -1,0 +1,153 @@
+dataset: "price_ohlcv"
+version: "1.0"
+
+layer: "price"
+type: "raw"
+
+description: >
+  Standardized OHLCV candlestick dataset.
+  Initial implementation uses Binance Spot BTCUSDT.
+
+source:
+  provider: "binance"
+  market: "spot"
+
+timezone: "UTC"
+
+symbols:
+  - "BTCUSDT"
+
+supported_timeframes:
+  - "1m"
+  - "5m"
+  - "15m"
+  - "1h"
+  - "4h"
+  - "1d"
+  - "1w"
+
+primary_key:
+  - "exchange"
+  - "symbol"
+  - "timeframe"
+  - "open_time"
+
+storage:
+  format: "parquet"
+  compression: "snappy"
+
+  partition_by:
+    - "exchange"
+    - "symbol"
+    - "timeframe"
+    - "year"
+    - "month"
+
+fields:
+
+  exchange:
+    type: "string"
+    nullable: false
+    description: "Exchange identifier"
+
+  symbol:
+    type: "string"
+    nullable: false
+    description: "Trading pair"
+
+  timeframe:
+    type: "string"
+    nullable: false
+    description: "Candlestick timeframe"
+
+  open_time:
+    type: "datetime64[ns, UTC]"
+    nullable: false
+    description: "Candle opening timestamp"
+
+  open:
+    type: "float64"
+    unit: "quote_currency"
+    nullable: false
+
+  high:
+    type: "float64"
+    unit: "quote_currency"
+    nullable: false
+
+  low:
+    type: "float64"
+    unit: "quote_currency"
+    nullable: false
+
+  close:
+    type: "float64"
+    unit: "quote_currency"
+    nullable: false
+
+  base_volume:
+    type: "float64"
+    unit: "base_currency"
+    nullable: false
+
+  quote_volume:
+    type: "float64"
+    unit: "quote_currency"
+    nullable: false
+
+  close_time:
+    type: "datetime64[ns, UTC]"
+    nullable: false
+
+  trade_count:
+    type: "int64"
+    unit: "count"
+    nullable: false
+
+  taker_buy_base_volume:
+    type: "float64"
+    unit: "base_currency"
+    nullable: false
+
+  taker_buy_quote_volume:
+    type: "float64"
+    unit: "quote_currency"
+    nullable: false
+
+  ingested_at:
+    type: "datetime64[ns, UTC]"
+    nullable: false
+    description: "Timestamp when CryptoLab ingested the record"
+
+quality_rules:
+
+  uniqueness:
+    columns:
+      - "exchange"
+      - "symbol"
+      - "timeframe"
+      - "open_time"
+
+  non_negative:
+    - "open"
+    - "high"
+    - "low"
+    - "close"
+    - "base_volume"
+    - "quote_volume"
+    - "trade_count"
+    - "taker_buy_base_volume"
+    - "taker_buy_quote_volume"
+
+  ohlc_rules:
+    - "high >= open"
+    - "high >= close"
+    - "high >= low"
+    - "low <= open"
+    - "low <= close"
+
+  timestamp_rules:
+    - "open_time < close_time"
+
+  missing_values:
+    allowed: false

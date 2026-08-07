@@ -1,0 +1,53 @@
+version: "1.0"
+
+sources:
+
+  binance_spot:
+    provider: "Binance"
+    market: "spot"
+    base_url: "https://api.binance.com"
+    timezone: "UTC"
+
+    datasets:
+      - price_ohlcv
+      - price_agg_trades
+
+    symbols:
+      - BTCUSDT
+
+    rate_limit_policy:
+      strategy: "respect_provider_limits"
+
+  binance_futures:
+    provider: "Binance"
+    market: "futures"
+    timezone: "UTC"
+
+    datasets:
+      - derivatives_open_interest
+      - derivatives_funding
+      - derivatives_liquidations
+
+  deribit:
+    provider: "Deribit"
+    market: "derivatives"
+    timezone: "UTC"
+
+    datasets:
+      - derivatives_options
+
+  farside:
+    provider: "Farside Investors"
+    market: "etf"
+    timezone: "UTC"
+
+    datasets:
+      - etf_flow
+
+  fred:
+    provider: "Federal Reserve Economic Data"
+    market: "macro"
+    timezone: "UTC"
+
+    datasets:
+      - macro_series

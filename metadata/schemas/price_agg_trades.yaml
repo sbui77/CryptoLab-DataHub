@@ -1,0 +1,102 @@
+dataset: "price_agg_trades"
+version: "1.0"
+
+layer: "price"
+type: "raw"
+
+description: >
+  Aggregated trade-level dataset from Binance aggTrades.
+
+source:
+  provider: "binance"
+  market: "spot"
+
+timezone: "UTC"
+
+primary_key:
+  - "exchange"
+  - "symbol"
+  - "agg_trade_id"
+
+storage:
+  format: "parquet"
+  compression: "snappy"
+
+  partition_by:
+    - "exchange"
+    - "symbol"
+    - "year"
+    - "month"
+    - "day"
+
+fields:
+
+  exchange:
+    type: "string"
+    nullable: false
+
+  symbol:
+    type: "string"
+    nullable: false
+
+  agg_trade_id:
+    type: "int64"
+    nullable: false
+
+  timestamp:
+    type: "datetime64[ns, UTC]"
+    nullable: false
+
+  price:
+    type: "float64"
+    unit: "quote_currency"
+    nullable: false
+
+  quantity:
+    type: "float64"
+    unit: "base_currency"
+    nullable: false
+
+  quote_quantity:
+    type: "float64"
+    unit: "quote_currency"
+    nullable: false
+
+  first_trade_id:
+    type: "int64"
+    nullable: false
+
+  last_trade_id:
+    type: "int64"
+    nullable: false
+
+  is_buyer_maker:
+    type: "bool"
+    nullable: false
+
+  trade_side:
+    type: "category"
+    allowed:
+      - "buy"
+      - "sell"
+    nullable: false
+
+  ingested_at:
+    type: "datetime64[ns, UTC]"
+    nullable: false
+
+quality_rules:
+
+  uniqueness:
+    columns:
+      - "exchange"
+      - "symbol"
+      - "agg_trade_id"
+
+  non_negative:
+    - "price"
+    - "quantity"
+    - "quote_quantity"
+
+  logical_rules:
+    - "first_trade_id <= last_trade_id"

@@ -1,0 +1,81 @@
+version: "1.0"
+project: "CryptoLab_DataHub"
+timezone: "UTC"
+
+naming:
+  field_case: "snake_case"
+  symbol_format: "uppercase"
+  exchange_format: "lowercase"
+
+storage:
+  default_format: "parquet"
+  compression: "snappy"
+
+datasets:
+
+  price_ohlcv:
+    layer: "price"
+    type: "raw"
+    schema: "metadata/schemas/price_ohlcv.yaml"
+    description: "OHLCV candlestick data from centralized exchanges"
+
+  price_agg_trades:
+    layer: "price"
+    type: "raw"
+    schema: "metadata/schemas/price_agg_trades.yaml"
+    description: "Aggregated trade-level data"
+
+  price_returns:
+    layer: "price"
+    type: "derived"
+    description: "Price return metrics"
+
+  price_range:
+    layer: "price"
+    type: "derived"
+    description: "Range and ATR metrics"
+
+  price_volatility:
+    layer: "price"
+    type: "derived"
+    description: "Realized and rolling volatility"
+
+  price_market_structure:
+    layer: "price"
+    type: "derived"
+    description: "Swing and market structure features"
+
+  auction_volume_profile:
+    layer: "auction"
+    type: "derived"
+    description: "Volume-at-price distribution"
+
+  orderflow_delta:
+    layer: "order_flow"
+    type: "derived"
+    description: "Aggressive buy/sell delta"
+
+  derivatives_open_interest:
+    layer: "derivatives"
+    type: "raw"
+    description: "Futures and perpetual open interest"
+
+  derivatives_funding:
+    layer: "derivatives"
+    type: "raw"
+    description: "Perpetual funding rates"
+
+  etf_flow:
+    layer: "etf"
+    type: "raw"
+    description: "Bitcoin ETF fund-level flows"
+
+  macro_series:
+    layer: "macro"
+    type: "raw"
+    description: "Macroeconomic time series"
+
+  onchain_valuation:
+    layer: "onchain"
+    type: "raw_or_vendor_derived"
+    description: "Bitcoin on-chain valuation metrics"
