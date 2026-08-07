@@ -216,3 +216,37 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment variables
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Raw / generated data
+data/raw/**
+data/curated/**
+data/features/**
+data/outputs/**
+
+# Keep directory structure
+!data/raw/.gitkeep
+!data/curated/.gitkeep
+!data/features/.gitkeep
+!data/outputs/.gitkeep
