@@ -1,0 +1,58 @@
+project:
+  name: "CryptoLab_DataHub"
+  version: "0.1.0"
+  timezone: "UTC"
+
+paths:
+  data_root: "data"
+  raw: "data/raw"
+  curated: "data/curated"
+  features: "data/features"
+  outputs: "data/outputs"
+  metadata: "metadata"
+  schemas: "metadata/schemas"
+  logs: "logs"
+
+storage:
+  default_format: "parquet"
+  compression: "snappy"
+
+price:
+  default_symbol: "BTCUSDT"
+  default_exchange: "binance"
+  default_market: "spot"
+
+  timeframes:
+    - "1m"
+    - "5m"
+    - "15m"
+    - "1h"
+    - "4h"
+    - "1d"
+    - "1w"
+
+binance:
+  spot:
+    base_url: "https://api.binance.com"
+
+    endpoints:
+      klines: "/api/v3/klines"
+      agg_trades: "/api/v3/aggTrades"
+
+    request:
+      timeout_seconds: 30
+      max_retries: 5
+      retry_backoff_seconds: 2
+
+    klines:
+      limit: 1000
+
+    agg_trades:
+      limit: 1000
+
+logging:
+  level: "INFO"
+  console: true
+  file: true
+  log_file: "logs/cryptolab.log"
+  format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
