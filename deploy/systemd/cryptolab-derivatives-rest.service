@@ -1,0 +1,26 @@
+[Unit]
+Description=CryptoLab Derivatives REST Incremental Update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+WorkingDirectory=/opt/cryptolab/CryptoLab-DataHub
+
+Environment=PYTHONPATH=/opt/cryptolab/CryptoLab-DataHub/src
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/cryptolab/venv/bin/python \
+    /opt/cryptolab/CryptoLab-DataHub/scripts/run_derivatives_production.py
+
+User=cryptolab
+Group=cryptolab
+
+Nice=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,63 @@
+name: Derivatives CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+  pull_request:
+    branches:
+      - main
+      - develop
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: derivatives-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Derivatives Test Suite
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile production modules
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m py_compile \
+            src/cryptolab/sources/binance_futures_http.py \
+            src/cryptolab/sources/binance_liquidation_ws.py \
+            src/cryptolab/pipelines/derivatives_update.py \
+            src/cryptolab/pipelines/liquidation_collector.py \
+            src/cryptolab/pipelines/liquidation_heartbeat.py \
+            src/cryptolab/pipelines/derivatives_quality_covered.py \
+            scripts/run_derivatives_production.py
+
+      - name: Run full test suite
+        env:
+          PYTHONPATH: src
+        run: |
+          pytest -v

@@ -1,0 +1,33 @@
+[Unit]
+Description=CryptoLab Binance Liquidation WebSocket Collector
+
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+WorkingDirectory=/opt/cryptolab/CryptoLab-DataHub
+
+Environment=PYTHONPATH=/opt/cryptolab/CryptoLab-DataHub/src
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/cryptolab/venv/bin/python \
+    /opt/cryptolab/CryptoLab-DataHub/scripts/run_liquidation_collector.py \
+    --symbol BTCUSDT \
+    --heartbeat-seconds 30
+
+User=cryptolab
+Group=cryptolab
+
+Restart=always
+RestartSec=10
+
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

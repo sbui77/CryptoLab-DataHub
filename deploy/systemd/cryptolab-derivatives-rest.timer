@@ -1,0 +1,15 @@
+[Unit]
+Description=Run CryptoLab Derivatives REST Update Every 15 Minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+
+AccuracySec=30s
+
+Persistent=true
+
+Unit=cryptolab-derivatives-rest.service
+
+[Install]
+WantedBy=timers.target

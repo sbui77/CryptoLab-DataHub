@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import time
 from typing import Any
 
 import pandas as pd
-import requests
+
+from cryptolab.sources.binance_futures_http import (
+    BinanceFuturesHTTPClient,
+    BinanceFuturesHTTPError,
+)
 
 
 BINANCE_FUTURES_BASE_URL = (
@@ -34,49 +37,47 @@ def _request_json(
     retry_backoff_seconds: float = 1.0,
 ) -> Any:
     """
-    Execute Binance Futures public REST request.
+    Execute Binance Futures public REST request through
+    the shared USD-M Futures HTTP client.
+
+    Endpoint-specific modules no longer implement their own
+    retry/rate-limit policy.
     """
 
-    url = (
-        BINANCE_FUTURES_BASE_URL
-        + endpoint
+    client = BinanceFuturesHTTPClient(
+        base_url=BINANCE_FUTURES_BASE_URL,
+        timeout_seconds=timeout,
+        max_retries=max_retries,
+        backoff_seconds=retry_backoff_seconds,
     )
 
-    last_error: Exception | None = None
+    try:
+        return client.get_json(
+            endpoint,
+            params=params,
+        )
 
-    for attempt in range(
-        1,
-        max_retries + 1,
-    ):
-        try:
-            response = requests.get(
-                url,
-                params=params,
-                timeout=timeout,
-            )
+    except BinanceFuturesHTTPError as exc:
+        raise BinanceOpenInterestError(
+            "Binance Open Interest request failed: "
+            f"{exc}"
+        ) from exc
 
-            response.raise_for_status()
 
-            return response.json()
+def _utc_timestamp(
+    value: pd.Timestamp,
+) -> pd.Timestamp:
+    result = pd.Timestamp(
+        value
+    )
 
-        except (
-            requests.RequestException,
-            ValueError,
-        ) as exc:
-            last_error = exc
+    if result.tzinfo is None:
+        return result.tz_localize(
+            "UTC"
+        )
 
-            if attempt >= max_retries:
-                break
-
-            time.sleep(
-                retry_backoff_seconds
-                * attempt
-            )
-
-    raise BinanceOpenInterestError(
-        "Binance Futures request failed "
-        f"after {max_retries} attempts: "
-        f"{last_error}"
+    return result.tz_convert(
+        "UTC"
     )
 
 
@@ -190,19 +191,13 @@ def fetch_open_interest_history(
         "limit": int(limit),
     }
 
+    start: pd.Timestamp | None = None
+    end: pd.Timestamp | None = None
+
     if start_time is not None:
-        start = pd.Timestamp(
+        start = _utc_timestamp(
             start_time
         )
-
-        if start.tzinfo is None:
-            start = start.tz_localize(
-                "UTC"
-            )
-        else:
-            start = start.tz_convert(
-                "UTC"
-            )
 
         params["startTime"] = int(
             start.timestamp()
@@ -210,18 +205,9 @@ def fetch_open_interest_history(
         )
 
     if end_time is not None:
-        end = pd.Timestamp(
+        end = _utc_timestamp(
             end_time
         )
-
-        if end.tzinfo is None:
-            end = end.tz_localize(
-                "UTC"
-            )
-        else:
-            end = end.tz_convert(
-                "UTC"
-            )
 
         params["endTime"] = int(
             end.timestamp()
@@ -229,8 +215,8 @@ def fetch_open_interest_history(
         )
 
     if (
-        start_time is not None
-        and end_time is not None
+        start is not None
+        and end is not None
         and end <= start
     ):
         raise ValueError(
@@ -250,22 +236,51 @@ def fetch_open_interest_history(
             "Unexpected historical OI response"
         )
 
+    columns = [
+        "exchange",
+        "market",
+        "symbol",
+        "period",
+        "timestamp",
+        "open_interest_base",
+        "open_interest_quote",
+    ]
+
     if not payload:
         return pd.DataFrame(
-            columns=[
-                "exchange",
-                "market",
-                "symbol",
-                "period",
-                "timestamp",
-                "open_interest_base",
-                "open_interest_quote",
-            ]
+            columns=columns
         )
 
-    rows = []
+    rows: list[dict[str, Any]] = []
 
     for item in payload:
+        if not isinstance(
+            item,
+            dict,
+        ):
+            raise BinanceOpenInterestError(
+                "Historical OI response contains "
+                "non-object row"
+            )
+
+        required = {
+            "symbol",
+            "sumOpenInterest",
+            "sumOpenInterestValue",
+            "timestamp",
+        }
+
+        missing = (
+            required
+            - set(item)
+        )
+
+        if missing:
+            raise BinanceOpenInterestError(
+                "Missing historical OI fields: "
+                f"{sorted(missing)}"
+            )
+
         rows.append(
             {
                 "exchange": "binance",
@@ -293,16 +308,15 @@ def fetch_open_interest_history(
         )
 
     result = pd.DataFrame(
-        rows
+        rows,
+        columns=columns,
     )
 
     return (
         result
         .sort_values("timestamp")
         .drop_duplicates(
-            subset=[
-                "timestamp",
-            ],
+            subset=["timestamp"],
             keep="last",
         )
         .reset_index(drop=True)
