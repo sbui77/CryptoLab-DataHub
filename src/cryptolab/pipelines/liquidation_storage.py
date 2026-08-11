@@ -15,7 +15,7 @@ class LiquidationStorageError(RuntimeError):
     """Raised when liquidation storage fails."""
 
 
-LIQUIDATION_COLUMNS = [
+LIQUIDATION_BASE_COLUMNS = [
     "exchange",
     "market",
     "symbol",
@@ -39,6 +39,37 @@ LIQUIDATION_COLUMNS = [
     "filled_quantity",
 
     "liquidation_notional",
+]
+
+
+LIQUIDATION_TIME_COLUMNS = [
+    "available_at",
+    "available_at_quality",
+    "ingested_at",
+    "ingested_at_quality",
+]
+
+
+LIQUIDATION_COLUMNS = (
+    LIQUIDATION_BASE_COLUMNS
+    + LIQUIDATION_TIME_COLUMNS
+)
+
+
+VALID_TIME_QUALITIES = {
+    "exact",
+    "derived",
+    "unknown",
+}
+
+
+LIQUIDATION_DEDUP_COLUMNS = [
+    "event_time",
+    "order_time",
+    "side",
+    "price",
+    "original_quantity",
+    "filled_quantity",
 ]
 
 
@@ -67,21 +98,304 @@ def _liquidation_root(
     )
 
 
+def _empty_liquidations() -> pd.DataFrame:
+    """
+    Return empty canonical liquidation DataFrame.
+    """
+
+    result = pd.DataFrame(
+        columns=LIQUIDATION_COLUMNS
+    )
+
+    for column in [
+        "event_time",
+        "order_time",
+        "available_at",
+        "ingested_at",
+    ]:
+        result[column] = pd.Series(
+            dtype="datetime64[ns, UTC]"
+        )
+
+    return result
+
+
+def _normalize_time_metadata(
+    result: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Normalize liquidation PIT metadata.
+
+    Legacy rows
+    -----------
+    If all four PIT columns are absent:
+
+        available_at = event_time
+        available_at_quality = derived
+        ingested_at = NaT
+        ingested_at_quality = unknown
+
+    Runtime WebSocket rows
+    ----------------------
+        available_at = local WS receive time
+        available_at_quality = exact
+        ingested_at = local persistence time
+        ingested_at_quality = exact
+
+    Partial PIT schemas are rejected.
+    """
+
+    metadata_columns = set(
+        LIQUIDATION_TIME_COLUMNS
+    )
+
+    present = {
+        column
+        for column in metadata_columns
+        if column in result.columns
+    }
+
+    if not present:
+        result[
+            "available_at"
+        ] = result[
+            "event_time"
+        ]
+
+        result[
+            "available_at_quality"
+        ] = "derived"
+
+        result[
+            "ingested_at"
+        ] = pd.Series(
+            pd.NaT,
+            index=result.index,
+            dtype="datetime64[ns, UTC]",
+        )
+
+        result[
+            "ingested_at_quality"
+        ] = "unknown"
+
+        return result
+
+    if present != metadata_columns:
+        missing = sorted(
+            metadata_columns
+            - present
+        )
+
+        raise LiquidationStorageError(
+            "Partial liquidation point-in-time metadata "
+            "detected. Missing columns: "
+            f"{missing}"
+        )
+
+    result[
+        "available_at"
+    ] = pd.to_datetime(
+        result[
+            "available_at"
+        ],
+        utc=True,
+        errors="coerce",
+    )
+
+    result[
+        "ingested_at"
+    ] = pd.to_datetime(
+        result[
+            "ingested_at"
+        ],
+        utc=True,
+        errors="coerce",
+    )
+
+    result[
+        "available_at_quality"
+    ] = (
+        result[
+            "available_at_quality"
+        ]
+        .astype("string")
+        .str.lower()
+    )
+
+    result[
+        "ingested_at_quality"
+    ] = (
+        result[
+            "ingested_at_quality"
+        ]
+        .astype("string")
+        .str.lower()
+    )
+
+    invalid_available_quality = (
+        result[
+            "available_at_quality"
+        ]
+        .isna()
+        | ~result[
+            "available_at_quality"
+        ].isin(
+            VALID_TIME_QUALITIES
+        )
+    )
+
+    if invalid_available_quality.any():
+        raise LiquidationStorageError(
+            "Invalid liquidation "
+            "available_at_quality"
+        )
+
+    invalid_ingested_quality = (
+        result[
+            "ingested_at_quality"
+        ]
+        .isna()
+        | ~result[
+            "ingested_at_quality"
+        ].isin(
+            VALID_TIME_QUALITIES
+        )
+    )
+
+    if invalid_ingested_quality.any():
+        raise LiquidationStorageError(
+            "Invalid liquidation "
+            "ingested_at_quality"
+        )
+
+    known_available = (
+        result[
+            "available_at_quality"
+        ]
+        != "unknown"
+    )
+
+    if (
+        result.loc[
+            known_available,
+            "available_at",
+        ]
+        .isna()
+        .any()
+    ):
+        raise LiquidationStorageError(
+            "Known liquidation available_at "
+            "cannot be null"
+        )
+
+    unknown_available = (
+        result[
+            "available_at_quality"
+        ]
+        == "unknown"
+    )
+
+    if (
+        result.loc[
+            unknown_available,
+            "available_at",
+        ]
+        .notna()
+        .any()
+    ):
+        raise LiquidationStorageError(
+            "Liquidation "
+            "available_at_quality='unknown' "
+            "requires available_at=NaT"
+        )
+
+    known_ingested = (
+        result[
+            "ingested_at_quality"
+        ]
+        != "unknown"
+    )
+
+    if (
+        result.loc[
+            known_ingested,
+            "ingested_at",
+        ]
+        .isna()
+        .any()
+    ):
+        raise LiquidationStorageError(
+            "Known liquidation ingested_at "
+            "cannot be null"
+        )
+
+    unknown_ingested = (
+        result[
+            "ingested_at_quality"
+        ]
+        == "unknown"
+    )
+
+    if (
+        result.loc[
+            unknown_ingested,
+            "ingested_at",
+        ]
+        .notna()
+        .any()
+    ):
+        raise LiquidationStorageError(
+            "Liquidation "
+            "ingested_at_quality='unknown' "
+            "requires ingested_at=NaT"
+        )
+
+    # For exact runtime ingestion, persistence cannot
+    # precede local receive time.
+    exact_runtime = (
+        result[
+            "available_at_quality"
+        ].eq("exact")
+        & result[
+            "ingested_at_quality"
+        ].eq("exact")
+    )
+
+    if (
+        result.loc[
+            exact_runtime,
+            "ingested_at",
+        ]
+        <
+        result.loc[
+            exact_runtime,
+            "available_at",
+        ]
+    ).any():
+        raise LiquidationStorageError(
+            "Liquidation ingested_at cannot precede "
+            "exact available_at"
+        )
+
+    return result
+
+
 def normalize_liquidations(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
     Normalize canonical liquidation events.
+
+    Supports both legacy liquidation partitions and
+    PIT-aware WebSocket runtime observations.
     """
 
     if df.empty:
-        return pd.DataFrame(
-            columns=LIQUIDATION_COLUMNS
-        )
+        return _empty_liquidations()
 
     missing = [
         column
-        for column in LIQUIDATION_COLUMNS
+        for column in LIQUIDATION_BASE_COLUMNS
         if column not in df.columns
     ]
 
@@ -120,7 +434,9 @@ def normalize_liquidations(
         result[column] = pd.to_numeric(
             result[column],
             errors="raise",
-        ).astype("float64")
+        ).astype(
+            "float64"
+        )
 
     result["exchange"] = (
         result["exchange"]
@@ -151,18 +467,45 @@ def normalize_liquidations(
         .str.lower()
     )
 
-    # Event stream has no globally documented liquidation ID.
-    # Use a compound event key to make repeated writes
-    # idempotent.
-    dedup_columns = [
-        "event_time",
-        "order_time",
-        "side",
-        "price",
-        "original_quantity",
-        "filled_quantity",
-    ]
+    result["order_type"] = (
+        result["order_type"]
+        .astype("string")
+    )
 
+    result["time_in_force"] = (
+        result["time_in_force"]
+        .astype("string")
+    )
+
+    result["order_status"] = (
+        result["order_status"]
+        .astype("string")
+    )
+
+    result = _normalize_time_metadata(
+        result
+    )
+
+    result[
+        "available_at_quality"
+    ] = (
+        result[
+            "available_at_quality"
+        ]
+        .astype("string")
+    )
+
+    result[
+        "ingested_at_quality"
+    ] = (
+        result[
+            "ingested_at_quality"
+        ]
+        .astype("string")
+    )
+
+    # Event stream has no globally documented liquidation ID.
+    # Continue using the established compound event key.
     return (
         result[
             LIQUIDATION_COLUMNS
@@ -174,7 +517,7 @@ def normalize_liquidations(
             ]
         )
         .drop_duplicates(
-            subset=dedup_columns,
+            subset=LIQUIDATION_DEDUP_COLUMNS,
             keep="last",
         )
         .reset_index(drop=True)
@@ -187,7 +530,11 @@ def save_liquidations(
     """
     Save liquidation events into daily Parquet partitions.
 
-    Existing partitions are merged and deduplicated.
+    Existing partitions are normalized BEFORE being merged
+    with incoming PIT-aware runtime observations.
+
+    This allows legacy and PIT-aware partitions to coexist
+    during lazy schema migration.
     """
 
     if df.empty:
@@ -351,24 +698,42 @@ def read_liquidations(
     exchange: str,
     symbol: str,
 ) -> pd.DataFrame:
+    """
+    Read all liquidation history.
+
+    Every partition is normalized independently BEFORE
+    cross-partition concatenation, preventing mixed-schema
+    PIT metadata from becoming artificial nulls.
+    """
+
     files = list_liquidation_files(
         exchange=exchange,
         symbol=symbol,
     )
 
     if not files:
-        return pd.DataFrame(
-            columns=LIQUIDATION_COLUMNS
+        return _empty_liquidations()
+
+    frames: list[pd.DataFrame] = []
+
+    for file in files:
+        raw = pd.read_parquet(
+            file
         )
 
-    frames = [
-        pd.read_parquet(file)
-        for file in files
-    ]
+        normalized = normalize_liquidations(
+            raw
+        )
+
+        frames.append(
+            normalized
+        )
+
+    result = pd.concat(
+        frames,
+        ignore_index=True,
+    )
 
     return normalize_liquidations(
-        pd.concat(
-            frames,
-            ignore_index=True,
-        )
+        result
     )

@@ -8,6 +8,9 @@ from cryptolab.sources.binance_futures_http import (
     BinanceFuturesHTTPClient,
     BinanceFuturesHTTPError,
 )
+from cryptolab.time_contract import (
+    attach_runtime_time_metadata,
+)
 
 
 BINANCE_FUTURES_BASE_URL = (
@@ -74,6 +77,43 @@ def _utc_timestamp(
     )
 
 
+def _empty_funding_frame() -> pd.DataFrame:
+    """
+    Return empty funding output with complete
+    point-in-time schema.
+    """
+
+    result = pd.DataFrame(
+        columns=[
+            "exchange",
+            "market",
+            "symbol",
+            "funding_time",
+            "funding_rate",
+            "mark_price",
+            "rate_type",
+            "available_at",
+            "available_at_quality",
+            "ingested_at",
+            "ingested_at_quality",
+        ]
+    )
+
+    result["funding_time"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result["available_at"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result["ingested_at"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    return result
+
+
 def fetch_funding_rate_history(
     symbol: str = "BTCUSDT",
     start_time: pd.Timestamp | None = None,
@@ -81,7 +121,7 @@ def fetch_funding_rate_history(
     limit: int = 1000,
 ) -> pd.DataFrame:
     """
-    Fetch Binance USDⓈ-M perpetual funding history.
+    Fetch Binance USD-M perpetual funding history.
 
     Canonical output
     ----------------
@@ -92,6 +132,25 @@ def fetch_funding_rate_history(
     funding_rate
     mark_price
     rate_type
+    available_at
+    available_at_quality
+    ingested_at
+    ingested_at_quality
+
+    Point-in-time semantics
+    -----------------------
+    available_at
+        Derived from funding_time.
+
+    available_at_quality
+        derived
+
+    ingested_at
+        Actual CryptoLab runtime timestamp for the
+        current REST response.
+
+    ingested_at_quality
+        exact
     """
 
     symbol = symbol.upper()
@@ -156,20 +215,8 @@ def fetch_funding_rate_history(
             "Unexpected funding history response"
         )
 
-    columns = [
-        "exchange",
-        "market",
-        "symbol",
-        "funding_time",
-        "funding_rate",
-        "mark_price",
-        "rate_type",
-    ]
-
     if not payload:
-        return pd.DataFrame(
-            columns=columns
-        )
+        return _empty_funding_frame()
 
     rows: list[dict[str, Any]] = []
 
@@ -179,7 +226,8 @@ def fetch_funding_rate_history(
             dict,
         ):
             raise BinanceFundingRateError(
-                "Funding history contains non-object row"
+                "Funding history contains "
+                "non-object row"
             )
 
         required = {
@@ -239,15 +287,21 @@ def fetch_funding_rate_history(
         )
 
     result = pd.DataFrame(
-        rows,
-        columns=columns,
+        rows
+    )
+
+    result = attach_runtime_time_metadata(
+        result,
+        event_time_column="funding_time",
     )
 
     return (
         result
         .sort_values("funding_time")
         .drop_duplicates(
-            subset=["funding_time"],
+            subset=[
+                "funding_time",
+            ],
             keep="last",
         )
         .reset_index(drop=True)

@@ -15,7 +15,7 @@ class OpenInterestStorageError(RuntimeError):
     """Raised when OI storage operations fail."""
 
 
-OPEN_INTEREST_COLUMNS = [
+OPEN_INTEREST_BASE_COLUMNS = [
     "exchange",
     "market",
     "symbol",
@@ -24,6 +24,27 @@ OPEN_INTEREST_COLUMNS = [
     "open_interest_base",
     "open_interest_quote",
 ]
+
+
+OPEN_INTEREST_TIME_COLUMNS = [
+    "available_at",
+    "available_at_quality",
+    "ingested_at",
+    "ingested_at_quality",
+]
+
+
+OPEN_INTEREST_COLUMNS = (
+    OPEN_INTEREST_BASE_COLUMNS
+    + OPEN_INTEREST_TIME_COLUMNS
+)
+
+
+VALID_TIME_QUALITIES = {
+    "exact",
+    "derived",
+    "unknown",
+}
 
 
 def _get_raw_root() -> Path:
@@ -53,17 +74,254 @@ def _open_interest_root(
     )
 
 
+def _empty_open_interest() -> pd.DataFrame:
+    """
+    Return empty canonical OI DataFrame including
+    point-in-time metadata.
+    """
+
+    result = pd.DataFrame(
+        columns=OPEN_INTEREST_COLUMNS
+    )
+
+    result["timestamp"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result["available_at"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result["ingested_at"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    return result
+
+
+def _normalize_time_metadata(
+    result: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Normalize OI point-in-time metadata.
+
+    Legacy partition
+    ----------------
+    If all four PIT columns are absent:
+
+        available_at = timestamp
+        available_at_quality = derived
+        ingested_at = NaT
+        ingested_at_quality = unknown
+
+    PIT-aware partition
+    -------------------
+    If any PIT column exists, all four must exist.
+
+    Each Parquet partition must be normalized before
+    cross-partition concatenation.
+    """
+
+    metadata_columns = set(
+        OPEN_INTEREST_TIME_COLUMNS
+    )
+
+    present = {
+        column
+        for column in metadata_columns
+        if column in result.columns
+    }
+
+    if not present:
+        result["available_at"] = (
+            result["timestamp"]
+        )
+
+        result[
+            "available_at_quality"
+        ] = "derived"
+
+        result["ingested_at"] = pd.Series(
+            pd.NaT,
+            index=result.index,
+            dtype="datetime64[ns, UTC]",
+        )
+
+        result[
+            "ingested_at_quality"
+        ] = "unknown"
+
+        return result
+
+    if present != metadata_columns:
+        missing = sorted(
+            metadata_columns - present
+        )
+
+        raise OpenInterestStorageError(
+            "Partial OI point-in-time metadata "
+            "detected. Missing columns: "
+            f"{missing}"
+        )
+
+    result["available_at"] = pd.to_datetime(
+        result["available_at"],
+        utc=True,
+        errors="coerce",
+    )
+
+    result["ingested_at"] = pd.to_datetime(
+        result["ingested_at"],
+        utc=True,
+        errors="coerce",
+    )
+
+    result[
+        "available_at_quality"
+    ] = (
+        result[
+            "available_at_quality"
+        ]
+        .astype("string")
+        .str.lower()
+    )
+
+    result[
+        "ingested_at_quality"
+    ] = (
+        result[
+            "ingested_at_quality"
+        ]
+        .astype("string")
+        .str.lower()
+    )
+
+    invalid_available_quality = (
+        result[
+            "available_at_quality"
+        ]
+        .isna()
+        | ~result[
+            "available_at_quality"
+        ].isin(
+            VALID_TIME_QUALITIES
+        )
+    )
+
+    if invalid_available_quality.any():
+        raise OpenInterestStorageError(
+            "Invalid OI available_at_quality"
+        )
+
+    invalid_ingested_quality = (
+        result[
+            "ingested_at_quality"
+        ]
+        .isna()
+        | ~result[
+            "ingested_at_quality"
+        ].isin(
+            VALID_TIME_QUALITIES
+        )
+    )
+
+    if invalid_ingested_quality.any():
+        raise OpenInterestStorageError(
+            "Invalid OI ingested_at_quality"
+        )
+
+    known_available = (
+        result[
+            "available_at_quality"
+        ]
+        != "unknown"
+    )
+
+    if (
+        result.loc[
+            known_available,
+            "available_at",
+        ]
+        .isna()
+        .any()
+    ):
+        raise OpenInterestStorageError(
+            "Known OI available_at cannot be null"
+        )
+
+    unknown_available = (
+        result[
+            "available_at_quality"
+        ]
+        == "unknown"
+    )
+
+    if (
+        result.loc[
+            unknown_available,
+            "available_at",
+        ]
+        .notna()
+        .any()
+    ):
+        raise OpenInterestStorageError(
+            "OI available_at_quality='unknown' "
+            "requires available_at=NaT"
+        )
+
+    known_ingested = (
+        result[
+            "ingested_at_quality"
+        ]
+        != "unknown"
+    )
+
+    if (
+        result.loc[
+            known_ingested,
+            "ingested_at",
+        ]
+        .isna()
+        .any()
+    ):
+        raise OpenInterestStorageError(
+            "Known OI ingested_at cannot be null"
+        )
+
+    unknown_ingested = (
+        result[
+            "ingested_at_quality"
+        ]
+        == "unknown"
+    )
+
+    if (
+        result.loc[
+            unknown_ingested,
+            "ingested_at",
+        ]
+        .notna()
+        .any()
+    ):
+        raise OpenInterestStorageError(
+            "OI ingested_at_quality='unknown' "
+            "requires ingested_at=NaT"
+        )
+
+    return result
+
+
 def normalize_open_interest(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
     Normalize OI history to canonical schema.
+
+    Supports both legacy and PIT-aware observations.
     """
 
     if df.empty:
-        return pd.DataFrame(
-            columns=OPEN_INTEREST_COLUMNS
-        )
+        return _empty_open_interest()
 
     required = [
         "exchange",
@@ -106,7 +364,9 @@ def normalize_open_interest(
         result[column] = pd.to_numeric(
             result[column],
             errors="raise",
-        ).astype("float64")
+        ).astype(
+            "float64"
+        )
 
     result["exchange"] = (
         result["exchange"]
@@ -130,6 +390,28 @@ def normalize_open_interest(
         .astype("string")
     )
 
+    result = _normalize_time_metadata(
+        result
+    )
+
+    result[
+        "available_at_quality"
+    ] = (
+        result[
+            "available_at_quality"
+        ]
+        .astype("string")
+    )
+
+    result[
+        "ingested_at_quality"
+    ] = (
+        result[
+            "ingested_at_quality"
+        ]
+        .astype("string")
+    )
+
     return (
         result[
             OPEN_INTEREST_COLUMNS
@@ -141,7 +423,9 @@ def normalize_open_interest(
             ],
             keep="last",
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
 
 
@@ -152,6 +436,9 @@ def save_open_interest(
     Save OI history into daily Parquet partitions.
 
     Existing daily partitions are merged and deduplicated.
+
+    Existing legacy partitions are normalized before
+    merging with PIT-aware runtime observations.
     """
 
     if df.empty:
@@ -328,6 +615,14 @@ def read_open_interest(
     symbol: str,
     period: str,
 ) -> pd.DataFrame:
+    """
+    Read all locally stored OI history.
+
+    Critical mixed-schema rule:
+    each partition is normalized independently BEFORE
+    cross-partition concatenation.
+    """
+
     files = list_open_interest_files(
         exchange=exchange,
         symbol=symbol,
@@ -335,20 +630,30 @@ def read_open_interest(
     )
 
     if not files:
-        return pd.DataFrame(
-            columns=OPEN_INTEREST_COLUMNS
+        return _empty_open_interest()
+
+    frames: list[pd.DataFrame] = []
+
+    for file in files:
+        raw = pd.read_parquet(
+            file
         )
 
-    frames = [
-        pd.read_parquet(file)
-        for file in files
-    ]
+        normalized = normalize_open_interest(
+            raw
+        )
+
+        frames.append(
+            normalized
+        )
+
+    result = pd.concat(
+        frames,
+        ignore_index=True,
+    )
 
     return normalize_open_interest(
-        pd.concat(
-            frames,
-            ignore_index=True,
-        )
+        result
     )
 
 

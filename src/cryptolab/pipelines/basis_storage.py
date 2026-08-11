@@ -12,10 +12,10 @@ from cryptolab.config import (
 
 
 class BasisStorageError(RuntimeError):
-    """Raised when basis storage fails."""
+    """Raised when futures basis storage fails."""
 
 
-BASIS_COLUMNS = [
+BASIS_BASE_COLUMNS = [
     "exchange",
     "market",
     "symbol",
@@ -30,11 +30,28 @@ BASIS_COLUMNS = [
 ]
 
 
-def _get_raw_root() -> Path:
-    """
-    Resolve raw-data root.
-    """
+BASIS_TIME_COLUMNS = [
+    "available_at",
+    "available_at_quality",
+    "ingested_at",
+    "ingested_at_quality",
+]
 
+
+BASIS_COLUMNS = (
+    BASIS_BASE_COLUMNS
+    + BASIS_TIME_COLUMNS
+)
+
+
+VALID_TIME_QUALITIES = {
+    "exact",
+    "derived",
+    "unknown",
+}
+
+
+def _get_raw_root() -> Path:
     config = load_config()
 
     return resolve_project_path(
@@ -51,10 +68,6 @@ def _basis_root(
     symbol: str,
     period: str,
 ) -> Path:
-    """
-    Canonical basis storage root.
-    """
-
     return (
         _get_raw_root()
         / "derivatives"
@@ -65,89 +78,388 @@ def _basis_root(
     )
 
 
+def _empty_basis() -> pd.DataFrame:
+    """
+    Return empty canonical Basis DataFrame.
+    """
+
+    result = pd.DataFrame(
+        columns=BASIS_COLUMNS
+    )
+
+    result["timestamp"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result["available_at"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result["ingested_at"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    return result
+
+
+def _normalize_time_metadata(
+    result: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Normalize Basis point-in-time metadata.
+
+    Legacy partition
+    ----------------
+    If all PIT columns are absent:
+
+        available_at = timestamp
+        available_at_quality = derived
+        ingested_at = NaT
+        ingested_at_quality = unknown
+
+    PIT-aware partition
+    -------------------
+    If any PIT column exists, all four must exist.
+
+    Each Parquet partition must be normalized before
+    cross-partition concatenation.
+    """
+
+    metadata_columns = set(
+        BASIS_TIME_COLUMNS
+    )
+
+    present = {
+        column
+        for column in metadata_columns
+        if column in result.columns
+    }
+
+    if not present:
+        result[
+            "available_at"
+        ] = result[
+            "timestamp"
+        ]
+
+        result[
+            "available_at_quality"
+        ] = "derived"
+
+        result[
+            "ingested_at"
+        ] = pd.Series(
+            pd.NaT,
+            index=result.index,
+            dtype="datetime64[ns, UTC]",
+        )
+
+        result[
+            "ingested_at_quality"
+        ] = "unknown"
+
+        return result
+
+    if present != metadata_columns:
+        missing = sorted(
+            metadata_columns
+            - present
+        )
+
+        raise BasisStorageError(
+            "Partial Basis point-in-time metadata "
+            "detected. Missing columns: "
+            f"{missing}"
+        )
+
+    result[
+        "available_at"
+    ] = pd.to_datetime(
+        result[
+            "available_at"
+        ],
+        utc=True,
+        errors="coerce",
+    )
+
+    result[
+        "ingested_at"
+    ] = pd.to_datetime(
+        result[
+            "ingested_at"
+        ],
+        utc=True,
+        errors="coerce",
+    )
+
+    result[
+        "available_at_quality"
+    ] = (
+        result[
+            "available_at_quality"
+        ]
+        .astype("string")
+        .str.lower()
+    )
+
+    result[
+        "ingested_at_quality"
+    ] = (
+        result[
+            "ingested_at_quality"
+        ]
+        .astype("string")
+        .str.lower()
+    )
+
+    invalid_available_quality = (
+        result[
+            "available_at_quality"
+        ]
+        .isna()
+        | ~result[
+            "available_at_quality"
+        ].isin(
+            VALID_TIME_QUALITIES
+        )
+    )
+
+    if invalid_available_quality.any():
+        raise BasisStorageError(
+            "Invalid Basis available_at_quality"
+        )
+
+    invalid_ingested_quality = (
+        result[
+            "ingested_at_quality"
+        ]
+        .isna()
+        | ~result[
+            "ingested_at_quality"
+        ].isin(
+            VALID_TIME_QUALITIES
+        )
+    )
+
+    if invalid_ingested_quality.any():
+        raise BasisStorageError(
+            "Invalid Basis ingested_at_quality"
+        )
+
+    known_available = (
+        result[
+            "available_at_quality"
+        ]
+        != "unknown"
+    )
+
+    if (
+        result.loc[
+            known_available,
+            "available_at",
+        ]
+        .isna()
+        .any()
+    ):
+        raise BasisStorageError(
+            "Known Basis available_at "
+            "cannot be null"
+        )
+
+    unknown_available = (
+        result[
+            "available_at_quality"
+        ]
+        == "unknown"
+    )
+
+    if (
+        result.loc[
+            unknown_available,
+            "available_at",
+        ]
+        .notna()
+        .any()
+    ):
+        raise BasisStorageError(
+            "Basis available_at_quality='unknown' "
+            "requires available_at=NaT"
+        )
+
+    known_ingested = (
+        result[
+            "ingested_at_quality"
+        ]
+        != "unknown"
+    )
+
+    if (
+        result.loc[
+            known_ingested,
+            "ingested_at",
+        ]
+        .isna()
+        .any()
+    ):
+        raise BasisStorageError(
+            "Known Basis ingested_at "
+            "cannot be null"
+        )
+
+    unknown_ingested = (
+        result[
+            "ingested_at_quality"
+        ]
+        == "unknown"
+    )
+
+    if (
+        result.loc[
+            unknown_ingested,
+            "ingested_at",
+        ]
+        .notna()
+        .any()
+    ):
+        raise BasisStorageError(
+            "Basis ingested_at_quality='unknown' "
+            "requires ingested_at=NaT"
+        )
+
+    return result
+
+
 def normalize_basis(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Normalize basis history to canonical schema.
+    Normalize futures Basis DataFrame.
+
+    Supports both legacy and PIT-aware observations.
     """
 
     if df.empty:
-        return pd.DataFrame(
-            columns=BASIS_COLUMNS
-        )
+        return _empty_basis()
 
     missing = [
         column
-        for column in BASIS_COLUMNS
+        for column in BASIS_BASE_COLUMNS
         if column not in df.columns
     ]
 
     if missing:
         raise BasisStorageError(
-            f"Missing basis columns: {missing}"
+            f"Missing Basis columns: {missing}"
         )
 
     result = df.copy()
 
-    result["timestamp"] = pd.to_datetime(
-        result["timestamp"],
+    result[
+        "timestamp"
+    ] = pd.to_datetime(
+        result[
+            "timestamp"
+        ],
         utc=True,
         errors="coerce",
     )
 
-    if result["timestamp"].isna().any():
+    if (
+        result[
+            "timestamp"
+        ]
+        .isna()
+        .any()
+    ):
         raise BasisStorageError(
-            "Invalid basis timestamp"
+            "Invalid Basis timestamp"
         )
 
-    required_numeric = [
+    for column in [
         "index_price",
         "futures_price",
         "basis",
         "basis_rate",
-    ]
-
-    for column in required_numeric:
-        result[column] = pd.to_numeric(
-            result[column],
-            errors="raise",
-        ).astype("float64")
+        "annualized_basis_rate",
+    ]:
+        result[
+            column
+        ] = pd.to_numeric(
+            result[
+                column
+            ],
+            errors="coerce",
+        ).astype(
+            "float64"
+        )
 
     result[
-        "annualized_basis_rate"
-    ] = pd.to_numeric(
+        "exchange"
+    ] = (
         result[
-            "annualized_basis_rate"
-        ],
-        errors="coerce",
-    ).astype("float64")
-
-    result["exchange"] = (
-        result["exchange"]
+            "exchange"
+        ]
         .astype("string")
         .str.lower()
     )
 
-    result["market"] = (
-        result["market"]
+    result[
+        "market"
+    ] = (
+        result[
+            "market"
+        ]
         .astype("string")
     )
 
-    result["symbol"] = (
-        result["symbol"]
+    result[
+        "symbol"
+    ] = (
+        result[
+            "symbol"
+        ]
         .astype("string")
         .str.upper()
     )
 
-    result["contract_type"] = (
-        result["contract_type"]
+    result[
+        "contract_type"
+    ] = (
+        result[
+            "contract_type"
+        ]
         .astype("string")
         .str.upper()
     )
 
-    result["period"] = (
-        result["period"]
+    result[
+        "period"
+    ] = (
+        result[
+            "period"
+        ]
+        .astype("string")
+    )
+
+    result = _normalize_time_metadata(
+        result
+    )
+
+    result[
+        "available_at_quality"
+    ] = (
+        result[
+            "available_at_quality"
+        ]
+        .astype("string")
+    )
+
+    result[
+        "ingested_at_quality"
+    ] = (
+        result[
+            "ingested_at_quality"
+        ]
         .astype("string")
     )
 
@@ -155,12 +467,18 @@ def normalize_basis(
         result[
             BASIS_COLUMNS
         ]
-        .sort_values("timestamp")
+        .sort_values(
+            "timestamp"
+        )
         .drop_duplicates(
-            subset=["timestamp"],
+            subset=[
+                "timestamp",
+            ],
             keep="last",
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
 
 
@@ -168,9 +486,10 @@ def save_basis(
     df: pd.DataFrame,
 ) -> list[Path]:
     """
-    Save basis history into daily Parquet partitions.
+    Save Basis into daily Parquet partitions.
 
-    Existing daily files are merged and deduplicated.
+    Existing partitions are normalized before merging
+    with runtime PIT-aware observations.
     """
 
     if df.empty:
@@ -181,28 +500,27 @@ def save_basis(
     )
 
     exchanges = (
-        work["exchange"]
+        work[
+            "exchange"
+        ]
         .dropna()
         .unique()
         .tolist()
     )
 
     symbols = (
-        work["symbol"]
+        work[
+            "symbol"
+        ]
         .dropna()
         .unique()
         .tolist()
     )
 
     periods = (
-        work["period"]
-        .dropna()
-        .unique()
-        .tolist()
-    )
-
-    contract_types = (
-        work["contract_type"]
+        work[
+            "period"
+        ]
         .dropna()
         .unique()
         .tolist()
@@ -212,11 +530,10 @@ def save_basis(
         len(exchanges) != 1
         or len(symbols) != 1
         or len(periods) != 1
-        or len(contract_types) != 1
     ):
         raise BasisStorageError(
             "save_basis requires one "
-            "exchange/symbol/period/contract_type"
+            "exchange/symbol/period"
         )
 
     exchange = str(
@@ -237,22 +554,36 @@ def save_basis(
         period=period,
     )
 
-    work["year"] = (
-        work["timestamp"]
+    work[
+        "year"
+    ] = (
+        work[
+            "timestamp"
+        ]
         .dt.year
     )
 
-    work["month"] = (
-        work["timestamp"]
+    work[
+        "month"
+    ] = (
+        work[
+            "timestamp"
+        ]
         .dt.month
     )
 
-    work["day"] = (
-        work["timestamp"]
+    work[
+        "day"
+    ] = (
+        work[
+            "timestamp"
+        ]
         .dt.day
     )
 
-    saved_files: list[Path] = []
+    saved_files: list[
+        Path
+    ] = []
 
     grouped = work.groupby(
         [
@@ -295,7 +626,9 @@ def save_basis(
                     "day",
                 ]
             )
-            .reset_index(drop=True)
+            .reset_index(
+                drop=True
+            )
         )
 
         if output.exists():
@@ -337,10 +670,6 @@ def list_basis_files(
     symbol: str,
     period: str,
 ) -> list[Path]:
-    """
-    List all stored basis partitions.
-    """
-
     root = _basis_root(
         exchange=exchange,
         symbol=symbol,
@@ -363,7 +692,11 @@ def read_basis(
     period: str,
 ) -> pd.DataFrame:
     """
-    Read all locally stored basis history.
+    Read all locally stored Basis history.
+
+    Critical mixed-schema rule:
+    each partition is normalized independently BEFORE
+    cross-partition concatenation.
     """
 
     files = list_basis_files(
@@ -373,20 +706,32 @@ def read_basis(
     )
 
     if not files:
-        return pd.DataFrame(
-            columns=BASIS_COLUMNS
+        return _empty_basis()
+
+    frames: list[
+        pd.DataFrame
+    ] = []
+
+    for file in files:
+        raw = pd.read_parquet(
+            file
         )
 
-    frames = [
-        pd.read_parquet(file)
-        for file in files
-    ]
+        normalized = normalize_basis(
+            raw
+        )
+
+        frames.append(
+            normalized
+        )
+
+    result = pd.concat(
+        frames,
+        ignore_index=True,
+    )
 
     return normalize_basis(
-        pd.concat(
-            frames,
-            ignore_index=True,
-        )
+        result
     )
 
 
@@ -395,10 +740,6 @@ def get_latest_basis_timestamp(
     symbol: str,
     period: str,
 ) -> pd.Timestamp | None:
-    """
-    Return latest locally stored basis timestamp.
-    """
-
     files = list_basis_files(
         exchange=exchange,
         symbol=symbol,
@@ -420,5 +761,7 @@ def get_latest_basis_timestamp(
     )
 
     return pd.Timestamp(
-        df["timestamp"].iloc[-1]
+        df[
+            "timestamp"
+        ].iloc[-1]
     )

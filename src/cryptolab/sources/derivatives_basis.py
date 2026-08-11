@@ -10,6 +10,9 @@ from cryptolab.sources.binance_futures_http import (
     BinanceFuturesIPBanError,
     BinanceFuturesRateLimitError,
 )
+from cryptolab.time_contract import (
+    attach_runtime_time_metadata,
+)
 
 
 BINANCE_FUTURES_BASE_URL = (
@@ -120,6 +123,47 @@ def _request_json(
         ) from exc
 
 
+def _empty_basis_frame() -> pd.DataFrame:
+    """
+    Return empty Basis DataFrame with complete
+    runtime point-in-time schema.
+    """
+
+    result = pd.DataFrame(
+        columns=[
+            "exchange",
+            "market",
+            "symbol",
+            "contract_type",
+            "period",
+            "timestamp",
+            "index_price",
+            "futures_price",
+            "basis",
+            "basis_rate",
+            "annualized_basis_rate",
+            "available_at",
+            "available_at_quality",
+            "ingested_at",
+            "ingested_at_quality",
+        ]
+    )
+
+    result["timestamp"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result["available_at"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result["ingested_at"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    return result
+
+
 def fetch_basis_history(
     pair: str = "BTCUSDT",
     contract_type: str = "PERPETUAL",
@@ -129,7 +173,7 @@ def fetch_basis_history(
     limit: int = 500,
 ) -> pd.DataFrame:
     """
-    Fetch Binance USDⓈ-M Futures basis history.
+    Fetch Binance USD-M Futures basis history.
 
     Canonical output
     ----------------
@@ -144,6 +188,25 @@ def fetch_basis_history(
     basis
     basis_rate
     annualized_basis_rate
+    available_at
+    available_at_quality
+    ingested_at
+    ingested_at_quality
+
+    Point-in-time semantics
+    -----------------------
+    available_at
+        Derived from Binance timestamp.
+
+    available_at_quality
+        derived
+
+    ingested_at
+        Actual CryptoLab runtime timestamp for the
+        current REST response.
+
+    ingested_at_quality
+        exact
     """
 
     pair = pair.upper()
@@ -225,24 +288,8 @@ def fetch_basis_history(
             f"{type(payload).__name__}"
         )
 
-    columns = [
-        "exchange",
-        "market",
-        "symbol",
-        "contract_type",
-        "period",
-        "timestamp",
-        "index_price",
-        "futures_price",
-        "basis",
-        "basis_rate",
-        "annualized_basis_rate",
-    ]
-
     if not payload:
-        return pd.DataFrame(
-            columns=columns
-        )
+        return _empty_basis_frame()
 
     rows: list[
         dict[str, Any]
@@ -328,8 +375,7 @@ def fetch_basis_history(
         )
 
     result = pd.DataFrame(
-        rows,
-        columns=columns,
+        rows
     )
 
     if (
@@ -352,14 +398,23 @@ def fetch_basis_history(
             "match requested contract type"
         )
 
+    result = attach_runtime_time_metadata(
+        result,
+        event_time_column="timestamp",
+    )
+
     return (
         result
         .sort_values(
             "timestamp"
         )
         .drop_duplicates(
-            subset=["timestamp"],
+            subset=[
+                "timestamp",
+            ],
             keep="last",
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )

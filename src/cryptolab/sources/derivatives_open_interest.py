@@ -8,6 +8,9 @@ from cryptolab.sources.binance_futures_http import (
     BinanceFuturesHTTPClient,
     BinanceFuturesHTTPError,
 )
+from cryptolab.time_contract import (
+    attach_runtime_time_metadata,
+)
 
 
 BINANCE_FUTURES_BASE_URL = (
@@ -81,11 +84,48 @@ def _utc_timestamp(
     )
 
 
+def _empty_history_frame() -> pd.DataFrame:
+    """
+    Return empty historical OI output with the runtime
+    point-in-time schema included.
+    """
+
+    result = pd.DataFrame(
+        columns=[
+            "exchange",
+            "market",
+            "symbol",
+            "period",
+            "timestamp",
+            "open_interest_base",
+            "open_interest_quote",
+            "available_at",
+            "available_at_quality",
+            "ingested_at",
+            "ingested_at_quality",
+        ]
+    )
+
+    result["timestamp"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result["available_at"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result["ingested_at"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    return result
+
+
 def fetch_current_open_interest(
     symbol: str = "BTCUSDT",
 ) -> pd.DataFrame:
     """
-    Fetch current Binance USDⓈ-M Futures Open Interest.
+    Fetch current Binance USD-M Futures Open Interest.
 
     This endpoint returns openInterest in base-asset units.
 
@@ -96,6 +136,25 @@ def fetch_current_open_interest(
     symbol
     timestamp
     open_interest_base
+    available_at
+    available_at_quality
+    ingested_at
+    ingested_at_quality
+
+    Point-in-time semantics
+    -----------------------
+    available_at
+        Derived from Binance timestamp.
+
+    available_at_quality
+        derived
+
+    ingested_at
+        Actual CryptoLab runtime timestamp for this
+        API response.
+
+    ingested_at_quality
+        exact
     """
 
     symbol = symbol.upper()
@@ -131,7 +190,7 @@ def fetch_current_open_interest(
             f"Missing current OI fields: {missing}"
         )
 
-    return pd.DataFrame(
+    result = pd.DataFrame(
         [
             {
                 "exchange": "binance",
@@ -151,6 +210,11 @@ def fetch_current_open_interest(
         ]
     )
 
+    return attach_runtime_time_metadata(
+        result,
+        event_time_column="timestamp",
+    )
+
 
 def fetch_open_interest_history(
     symbol: str = "BTCUSDT",
@@ -160,7 +224,7 @@ def fetch_open_interest_history(
     limit: int = 500,
 ) -> pd.DataFrame:
     """
-    Fetch historical Binance USDⓈ-M Open Interest Statistics.
+    Fetch historical Binance USD-M Open Interest Statistics.
 
     Output
     ------
@@ -171,6 +235,19 @@ def fetch_open_interest_history(
     timestamp
     open_interest_base
     open_interest_quote
+    available_at
+    available_at_quality
+    ingested_at
+    ingested_at_quality
+
+    Point-in-time semantics
+    -----------------------
+    Each historical observation keeps its own source timestamp
+    as available_at with quality=derived.
+
+    ingested_at records when CryptoLab fetched this batch now;
+    it does NOT claim CryptoLab possessed the observation at
+    the historical event time.
     """
 
     symbol = symbol.upper()
@@ -236,20 +313,8 @@ def fetch_open_interest_history(
             "Unexpected historical OI response"
         )
 
-    columns = [
-        "exchange",
-        "market",
-        "symbol",
-        "period",
-        "timestamp",
-        "open_interest_base",
-        "open_interest_quote",
-    ]
-
     if not payload:
-        return pd.DataFrame(
-            columns=columns
-        )
+        return _empty_history_frame()
 
     rows: list[dict[str, Any]] = []
 
@@ -308,8 +373,12 @@ def fetch_open_interest_history(
         )
 
     result = pd.DataFrame(
-        rows,
-        columns=columns,
+        rows
+    )
+
+    result = attach_runtime_time_metadata(
+        result,
+        event_time_column="timestamp",
     )
 
     return (

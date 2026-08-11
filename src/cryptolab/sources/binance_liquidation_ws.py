@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import time
 from typing import Callable, Iterator
 
@@ -15,6 +16,18 @@ class BinanceLiquidationWebSocketError(
     RuntimeError
 ):
     """Raised when Binance liquidation WebSocket fails."""
+
+
+def _utc_now() -> datetime:
+    """
+    Return timezone-aware current UTC time.
+
+    This clock is used for point-in-time receive metadata.
+    """
+
+    return datetime.now(
+        timezone.utc
+    )
 
 
 @dataclass(frozen=True)
@@ -32,13 +45,30 @@ class LiquidationWebSocketMessage:
         receive-timeout interval, but the WebSocket connection
         is still alive.
 
-    Heartbeat ticks allow the collector to prove connectivity
-    independently of liquidation-event frequency.
+    received_at_monotonic
+    ---------------------
+    Monotonic process clock used for collector control logic.
+
+    received_at
+    -----------
+    UTC wall-clock timestamp captured at the WebSocket receive
+    boundary.
+
+    For kind="message", this timestamp is captured immediately
+    after ws.recv() returns and BEFORE decoding/parsing.
+
+    This is the canonical exact available_at timestamp for new
+    liquidation observations.
+
+    The field is optional for backward compatibility with older
+    tests/custom stream factories. Production WebSocket messages
+    emitted by stream_liquidation_messages always populate it.
     """
 
     received_at_monotonic: float
     kind: str
     payload: str | None
+    received_at: datetime | None = None
 
 
 def stream_liquidation_messages(
@@ -46,6 +76,7 @@ def stream_liquidation_messages(
     receive_timeout_seconds: float = 10.0,
     connect_timeout_seconds: float = 15.0,
     create_connection_fn: Callable | None = None,
+    utc_now_fn: Callable[[], datetime] = _utc_now,
 ) -> Iterator[LiquidationWebSocketMessage]:
     """
     Connect to Binance liquidation WebSocket.
@@ -59,6 +90,17 @@ def stream_liquidation_messages(
         kind="heartbeat"
             when recv() times out while the connection remains
             active.
+
+    Point-in-time contract
+    ----------------------
+    For every real message:
+
+        received_at
+
+    is captured immediately after recv() returns.
+
+    This timestamp represents the earliest local time at which
+    CryptoLab can prove that the message was available.
 
     Reconnection belongs to the collector layer.
     """
@@ -105,6 +147,13 @@ def stream_liquidation_messages(
             try:
                 message = ws.recv()
 
+                # Capture receive clocks immediately after
+                # recv() returns and before any decoding/parsing.
+                received_at = utc_now_fn()
+                received_at_monotonic = (
+                    time.monotonic()
+                )
+
             except websocket.WebSocketTimeoutException:
                 yield LiquidationWebSocketMessage(
                     received_at_monotonic=(
@@ -112,6 +161,7 @@ def stream_liquidation_messages(
                     ),
                     kind="heartbeat",
                     payload=None,
+                    received_at=utc_now_fn(),
                 )
 
                 continue
@@ -141,10 +191,11 @@ def stream_liquidation_messages(
 
             yield LiquidationWebSocketMessage(
                 received_at_monotonic=(
-                    time.monotonic()
+                    received_at_monotonic
                 ),
                 kind="message",
                 payload=message,
+                received_at=received_at,
             )
 
     except BinanceLiquidationWebSocketError:

@@ -63,8 +63,11 @@ def save_aggtrades(
         month
         day
 
-    Existing daily files are merged with incoming data and
-    deduplicated by agg_trade_id.
+    Existing daily files are normalized before being
+    merged with incoming PIT-aware data.
+
+    Deduplication key:
+        agg_trade_id
 
     Raw trades are never fabricated or interpolated.
     """
@@ -190,6 +193,9 @@ def save_aggtrades(
                 output
             )
 
+            # Critical schema-evolution rule:
+            # normalize the existing partition before
+            # concatenating it with PIT-aware runtime rows.
             existing = normalize_aggtrades(
                 existing
             )
@@ -265,6 +271,16 @@ def read_aggtrades(
 ) -> pd.DataFrame:
     """
     Read all stored aggTrades for an exchange/symbol.
+
+    Mixed-schema rule
+    -----------------
+    Every Parquet partition is normalized independently
+    BEFORE cross-partition concatenation.
+
+    This allows legacy partitions and PIT-aware partitions
+    to coexist safely.
+
+    Global deduplication is performed by agg_trade_id.
     """
 
     files = list_aggtrades_files(
@@ -277,10 +293,22 @@ def read_aggtrades(
             columns=AGGTRADE_COLUMNS
         )
 
-    frames = [
-        pd.read_parquet(file)
-        for file in files
-    ]
+    frames: list[
+        pd.DataFrame
+    ] = []
+
+    for file in files:
+        raw = pd.read_parquet(
+            file
+        )
+
+        normalized = normalize_aggtrades(
+            raw
+        )
+
+        frames.append(
+            normalized
+        )
 
     result = pd.concat(
         frames,

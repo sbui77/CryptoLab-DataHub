@@ -58,6 +58,96 @@ def _utc_now() -> datetime:
     )
 
 
+def _as_utc_timestamp(
+    value: datetime | pd.Timestamp,
+) -> pd.Timestamp:
+    """
+    Normalize datetime-like value to timezone-aware UTC.
+    """
+
+    result = pd.Timestamp(
+        value
+    )
+
+    if result.tzinfo is None:
+        return result.tz_localize(
+            "UTC"
+        )
+
+    return result.tz_convert(
+        "UTC"
+    )
+
+
+def _attach_liquidation_runtime_metadata(
+    frame: pd.DataFrame,
+    received_at: datetime | None,
+) -> pd.DataFrame:
+    """
+    Attach PIT metadata to a parsed liquidation frame.
+
+    Production WebSocket message
+    ----------------------------
+        available_at = exact local WS receive timestamp
+        ingested_at = exact current persistence timestamp
+
+    Compatibility fallback
+    ----------------------
+    Older custom/test stream factories may not populate
+    received_at.
+
+    In that case we DO NOT falsely claim an exact receive
+    timestamp:
+
+        available_at = event_time
+        available_at_quality = derived
+
+    The ingestion timestamp remains exact because CryptoLab
+    knows when this invocation reaches persistence.
+    """
+
+    result = frame.copy()
+
+    if received_at is None:
+        result[
+            "available_at"
+        ] = result[
+            "event_time"
+        ]
+
+        result[
+            "available_at_quality"
+        ] = "derived"
+
+    else:
+        available_at = _as_utc_timestamp(
+            received_at
+        )
+
+        result[
+            "available_at"
+        ] = available_at
+
+        result[
+            "available_at_quality"
+        ] = "exact"
+
+    # Capture as close as possible to persistence.
+    ingested_at = pd.Timestamp.now(
+        tz="UTC"
+    )
+
+    result[
+        "ingested_at"
+    ] = ingested_at
+
+    result[
+        "ingested_at_quality"
+    ] = "exact"
+
+    return result
+
+
 def _backoff_seconds(
     reconnect_count: int,
     base_seconds: float,
@@ -183,11 +273,27 @@ def run_liquidation_collector(
         - max_runtime enforcement
         - proof that a zero-event period was actually observed
 
-    connected=True:
-        WebSocket connection is alive.
+    Point-in-time contract
+    ----------------------
+    Production liquidation message:
 
-    connected=False:
-        WebSocket ended/failed or collector stopped.
+        event_time
+            Binance forceOrder event timestamp.
+
+        available_at
+            UTC timestamp captured immediately after ws.recv().
+
+        available_at_quality
+            exact
+
+        ingested_at
+            UTC timestamp captured immediately before storage.
+
+        ingested_at_quality
+            exact
+
+    Heartbeat observations remain a separate collector-coverage
+    dataset and are NOT liquidation market events.
     """
 
     exchange = exchange.lower()
@@ -410,6 +516,13 @@ def run_liquidation_collector(
                     continue
 
                 if not frame.empty:
+                    frame = (
+                        _attach_liquidation_runtime_metadata(
+                            frame=frame,
+                            received_at=item.received_at,
+                        )
+                    )
+
                     liquidation_rows += len(
                         frame
                     )

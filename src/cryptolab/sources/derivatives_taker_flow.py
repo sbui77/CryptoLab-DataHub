@@ -10,6 +10,9 @@ from cryptolab.sources.binance_futures_http import (
     BinanceFuturesIPBanError,
     BinanceFuturesRateLimitError,
 )
+from cryptolab.time_contract import (
+    attach_runtime_time_metadata,
+)
 
 
 BINANCE_FUTURES_BASE_URL = (
@@ -98,6 +101,44 @@ def _request_json(
         ) from exc
 
 
+def _empty_taker_flow_frame() -> pd.DataFrame:
+    """
+    Return empty Taker Flow DataFrame with complete
+    runtime point-in-time schema.
+    """
+
+    result = pd.DataFrame(
+        columns=[
+            "exchange",
+            "market",
+            "symbol",
+            "period",
+            "timestamp",
+            "buy_volume",
+            "sell_volume",
+            "buy_sell_ratio",
+            "available_at",
+            "available_at_quality",
+            "ingested_at",
+            "ingested_at_quality",
+        ]
+    )
+
+    result["timestamp"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result["available_at"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result["ingested_at"] = pd.Series(
+        dtype="datetime64[ns, UTC]"
+    )
+
+    return result
+
+
 def fetch_taker_flow_history(
     symbol: str = "BTCUSDT",
     period: str = "5m",
@@ -106,7 +147,7 @@ def fetch_taker_flow_history(
     limit: int = 500,
 ) -> pd.DataFrame:
     """
-    Fetch Binance USDⓈ-M futures Taker Buy/Sell Volume.
+    Fetch Binance USD-M Futures Taker Buy/Sell Volume.
 
     Canonical output
     ----------------
@@ -118,6 +159,25 @@ def fetch_taker_flow_history(
     buy_volume
     sell_volume
     buy_sell_ratio
+    available_at
+    available_at_quality
+    ingested_at
+    ingested_at_quality
+
+    Point-in-time semantics
+    -----------------------
+    available_at
+        Derived from Binance timestamp.
+
+    available_at_quality
+        derived
+
+    ingested_at
+        Actual CryptoLab runtime timestamp for the
+        current REST response.
+
+    ingested_at_quality
+        exact
     """
 
     symbol = symbol.upper()
@@ -185,21 +245,8 @@ def fetch_taker_flow_history(
             f"response type: {type(payload).__name__}"
         )
 
-    columns = [
-        "exchange",
-        "market",
-        "symbol",
-        "period",
-        "timestamp",
-        "buy_volume",
-        "sell_volume",
-        "buy_sell_ratio",
-    ]
-
     if not payload:
-        return pd.DataFrame(
-            columns=columns
-        )
+        return _empty_taker_flow_frame()
 
     rows: list[
         dict[str, Any]
@@ -257,16 +304,26 @@ def fetch_taker_flow_history(
         )
 
     result = pd.DataFrame(
-        rows,
-        columns=columns,
+        rows
+    )
+
+    result = attach_runtime_time_metadata(
+        result,
+        event_time_column="timestamp",
     )
 
     return (
         result
-        .sort_values("timestamp")
+        .sort_values(
+            "timestamp"
+        )
         .drop_duplicates(
-            subset=["timestamp"],
+            subset=[
+                "timestamp",
+            ],
             keep="last",
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
