@@ -59,11 +59,15 @@ def build_derivatives_regime_dataset(
         )
     )
 
+    # MIGRATION DEBT: the regime layer is built on price x OI
+    # and spot x perp inputs that are not yet availability
+    # aware, so availability is not propagated here.
     derivatives = (
         build_derivatives_feature_dataset(
             exchange=exchange,
             symbol=symbol,
             period=derivatives_period,
+            require_availability=False,
         )
     )
 

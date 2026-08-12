@@ -67,11 +67,15 @@ def build_spot_perp_flow_dataset(
             "Spot Trade Flow dataset is empty"
         )
 
+    # MIGRATION DEBT: the spot trade-flow layer does not yet
+    # carry available_at, so a combined spot x perp availability
+    # cannot be derived here.
     derivatives = (
         build_derivatives_feature_dataset(
             exchange=exchange,
             symbol=symbol,
             period=derivatives_period,
+            require_availability=False,
         )
     )
 

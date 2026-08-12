@@ -9,6 +9,9 @@ from cryptolab.config import (
     load_config,
     resolve_project_path,
 )
+from cryptolab.features.availability import (
+    AVAILABLE_AT,
+)
 from cryptolab.features.derivatives import (
     build_derivatives_features,
 )
@@ -39,10 +42,20 @@ def build_derivatives_feature_dataset(
     exchange: str = "binance",
     symbol: str = "BTCUSDT",
     period: str = "5m",
+    require_availability: bool = True,
 ) -> pd.DataFrame:
     """
     Build complete derivatives feature dataset
     from locally stored raw datasets.
+
+    require_availability
+        Raw storage always carries the point-in-time contract,
+        so production builds require it.
+
+        Consumers that join this dataset with a layer which has
+        not yet been migrated must pass False. Emitting a
+        derivatives-only available_at into a combined artifact
+        would understate that artifact's true availability.
     """
 
     open_interest = read_open_interest(
@@ -84,6 +97,9 @@ def build_derivatives_feature_dataset(
         basis=basis,
         taker_flow=taker_flow,
         liquidations=liquidations,
+        require_availability=(
+            require_availability
+        ),
     )
 
 
@@ -119,6 +135,13 @@ def save_derivatives_features(
     if df.empty:
         raise DerivativesFeaturePipelineError(
             "Cannot save empty derivatives dataset"
+        )
+
+    if AVAILABLE_AT not in df.columns:
+        raise DerivativesFeaturePipelineError(
+            "Derivatives feature artifact is missing "
+            "available_at; the point-in-time contract "
+            "must be persisted with the data"
         )
 
     directory = (

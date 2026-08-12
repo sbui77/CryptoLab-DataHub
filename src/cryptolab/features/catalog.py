@@ -582,7 +582,7 @@ FEATURE_SPECS = (
 
     FeatureSpec(
         feature_id="derivatives.core",
-        version="1.0.0",
+        version="1.1.0",
         callable_path=(
             "cryptolab.features.derivatives:"
             "build_derivatives_features"
@@ -616,13 +616,17 @@ FEATURE_SPECS = (
             "total_liquidation_notional",
             "liquidation_delta",
             "liquidation_imbalance",
+            "available_at",
         ),
         event_time_column="timestamp",
         availability_policy=(
             AvailabilityPolicy.MAX_INPUT_AVAILABLE_AT
         ),
         description=(
-            "Canonical multi-source derivatives feature layer."
+            "Canonical multi-source derivatives feature layer. "
+            "Emits available_at as the maximum availability of "
+            "the raw observations actually consumed by each "
+            "row."
         ),
         tags=(
             "derivatives",

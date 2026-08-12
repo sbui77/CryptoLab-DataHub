@@ -63,11 +63,16 @@ def build_price_oi_state_dataset(
         timeframe=price_timeframe,
     )
 
+    # MIGRATION DEBT: the price layer does not yet carry
+    # available_at, so a combined price x OI availability cannot
+    # be derived. Emitting the derivatives-only value would
+    # understate this artifact's true availability.
     derivatives = (
         build_derivatives_feature_dataset(
             exchange=exchange,
             symbol=symbol,
             period=derivatives_period,
+            require_availability=False,
         )
     )
 

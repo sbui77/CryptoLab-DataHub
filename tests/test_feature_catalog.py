@@ -211,10 +211,54 @@ def test_derivatives_regime_dependency_chain():
     }
 
 
-def test_catalog_versions_start_at_1_0_0():
-    assert {
-        spec.version
+# Features whose published output contract has moved beyond the
+# initial 1.0.0 release, with the reason for each bump.
+#
+# A minor bump means the output contract gained columns without
+# changing the meaning of existing ones.
+EXPECTED_VERSION_OVERRIDES = {
+    # Emits available_at (point-in-time availability layer).
+    "derivatives.core": "1.1.0",
+}
+
+
+def test_catalog_versions_match_expected_bumps():
+    """
+    Every feature sits at 1.0.0 unless an intentional bump is
+    recorded above.
+
+    This asserts the intended version mapping rather than mere
+    semver well-formedness, which FeatureSpec already enforces.
+    """
+
+    expected = {
+        spec.feature_id: (
+            EXPECTED_VERSION_OVERRIDES.get(
+                spec.feature_id,
+                "1.0.0",
+            )
+        )
         for spec in FEATURE_SPECS
-    } == {
-        "1.0.0",
     }
+
+    actual = {
+        spec.feature_id: spec.version
+        for spec in FEATURE_SPECS
+    }
+
+    assert actual == expected
+
+
+def test_version_overrides_reference_real_features():
+    """
+    A stale override would silently stop asserting anything.
+    """
+
+    feature_ids = {
+        spec.feature_id
+        for spec in FEATURE_SPECS
+    }
+
+    assert set(
+        EXPECTED_VERSION_OVERRIDES
+    ) <= feature_ids
