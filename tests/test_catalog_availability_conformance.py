@@ -10,6 +10,7 @@ than a silent correctness gap.
 
 from cryptolab.features.availability import (
     AVAILABLE_AT,
+    AVAILABLE_AT_QUALITY,
 )
 from cryptolab.features.catalog import (
     FEATURE_REGISTRY,
@@ -63,10 +64,43 @@ PENDING_AVAILABILITY_MIGRATION = frozenset(
 def declares_availability(
     spec,
 ) -> bool:
-    return (
-        AVAILABLE_AT
-        in spec.output_columns
+    """
+    A migrated feature declares the strict metadata pair.
+
+    An availability timestamp with no declared evidence quality
+    is not a complete contract, so it does not count as migrated.
+    """
+
+    return {
+        AVAILABLE_AT,
+        AVAILABLE_AT_QUALITY,
+    } <= set(
+        spec.output_columns
     )
+
+
+def test_no_feature_declares_half_the_pair():
+    """
+    available_at and available_at_quality are one contract. A
+    feature declaring one without the other would publish a
+    timestamp whose evidence cannot be told apart from exact.
+    """
+
+    for spec in FEATURE_SPECS:
+        declared = {
+            AVAILABLE_AT,
+            AVAILABLE_AT_QUALITY,
+        } & set(
+            spec.output_columns
+        )
+
+        assert declared in (
+            set(),
+            {
+                AVAILABLE_AT,
+                AVAILABLE_AT_QUALITY,
+            },
+        ), spec.feature_id
 
 
 def test_migration_debt_is_exactly_enumerated():
@@ -197,6 +231,7 @@ def test_derivatives_core_output_matches_declaration():
                 12,
             ),
             "available_at": times,
+            "available_at_quality": "derived",
         }
     )
 
@@ -222,6 +257,9 @@ def test_derivatives_core_output_matches_declaration():
             ),
             "available_at": [
                 times[2],
+            ],
+            "available_at_quality": [
+                "derived",
             ],
         }
     )

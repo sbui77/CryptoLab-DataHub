@@ -217,8 +217,9 @@ def test_derivatives_regime_dependency_chain():
 # A minor bump means the output contract gained columns without
 # changing the meaning of existing ones.
 EXPECTED_VERSION_OVERRIDES = {
-    # Emits available_at (point-in-time availability layer).
-    "derivatives.core": "1.1.0",
+    # 1.1.0 emits available_at (point-in-time availability
+    # layer); 1.2.0 adds available_at_quality, its strict pair.
+    "derivatives.core": "1.2.0",
 }
 
 

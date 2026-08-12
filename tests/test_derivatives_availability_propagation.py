@@ -24,6 +24,36 @@ def bar_times() -> pd.DatetimeIndex:
     )
 
 
+def availability_quality(
+    values: object,
+    quality: str = "derived",
+) -> list[str]:
+    """
+    Quality labels matching an availability series.
+
+    The raw contract is a strict pair, so unknown availability is
+    always labelled unknown and everything else carries the given
+    evidence quality.
+    """
+
+    normalized = pd.to_datetime(
+        pd.Series(
+            values
+        ),
+        utc=True,
+        errors="coerce",
+    )
+
+    return [
+        quality
+        if pd.notna(
+            value
+        )
+        else "unknown"
+        for value in normalized
+    ]
+
+
 def make_open_interest(
     available_at: object | None,
 ) -> pd.DataFrame:
@@ -54,6 +84,12 @@ def make_open_interest(
             "available_at"
         ] = available_at
 
+        frame[
+            "available_at_quality"
+        ] = availability_quality(
+            available_at
+        )
+
     return frame
 
 
@@ -74,6 +110,12 @@ def make_basis(
     if with_availability:
         frame["available_at"] = times
 
+        frame[
+            "available_at_quality"
+        ] = availability_quality(
+            times
+        )
+
     return frame
 
 
@@ -93,6 +135,12 @@ def make_taker_flow(
 
     if with_availability:
         frame["available_at"] = times
+
+        frame[
+            "available_at_quality"
+        ] = availability_quality(
+            times
+        )
 
     return frame
 
@@ -123,6 +171,12 @@ def make_liquidations(
             if available_at is not None
             else times[3]
         ]
+
+        frame[
+            "available_at_quality"
+        ] = availability_quality(
+            frame["available_at"]
+        )
 
     return frame
 
@@ -159,6 +213,12 @@ def make_funding(
             if available_at is not None
             else times[4]
         ]
+
+        frame[
+            "available_at_quality"
+        ] = availability_quality(
+            frame["available_at"]
+        )
 
     return frame
 
@@ -216,6 +276,18 @@ def build(
 LONG_BARS = 300
 
 
+def empty_liquidations() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "event_time": [],
+            "liquidation_side": [],
+            "liquidation_notional": [],
+            "available_at": [],
+            "available_at_quality": [],
+        }
+    )
+
+
 def long_bar_times() -> pd.DatetimeIndex:
     return pd.date_range(
         "2024-01-01",
@@ -232,6 +304,24 @@ def build_long(
     liquidations: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     times = long_bar_times()
+
+    oi_availability = (
+        times
+        if oi_available is None
+        else oi_available
+    )
+
+    basis_availability = (
+        times
+        if basis_available is None
+        else basis_available
+    )
+
+    taker_availability = (
+        times
+        if taker_available is None
+        else taker_available
+    )
 
     open_interest = pd.DataFrame(
         {
@@ -251,9 +341,12 @@ def build_long(
                 LONG_BARS,
             ),
             "available_at": (
-                times
-                if oi_available is None
-                else oi_available
+                oi_availability
+            ),
+            "available_at_quality": (
+                availability_quality(
+                    oi_availability
+                )
             ),
         }
     )
@@ -269,9 +362,12 @@ def build_long(
             ),
             "annualized_basis_rate": 0.1,
             "available_at": (
-                times
-                if basis_available is None
-                else basis_available
+                basis_availability
+            ),
+            "available_at_quality": (
+                availability_quality(
+                    basis_availability
+                )
             ),
         }
     )
@@ -283,9 +379,12 @@ def build_long(
             "sell_volume": 8.0,
             "buy_sell_ratio": 1.25,
             "available_at": (
-                times
-                if taker_available is None
-                else taker_available
+                taker_availability
+            ),
+            "available_at_quality": (
+                availability_quality(
+                    taker_availability
+                )
             ),
         }
     )
@@ -310,18 +409,14 @@ def build_long(
             "available_at": [
                 times[0],
             ],
+            "available_at_quality": [
+                "derived",
+            ],
         }
     )
 
     if liquidations is None:
-        liquidations = pd.DataFrame(
-            {
-                "event_time": [],
-                "liquidation_side": [],
-                "liquidation_notional": [],
-                "available_at": [],
-            }
-        )
+        liquidations = empty_liquidations()
 
     return build_derivatives_features(
         open_interest=open_interest,
@@ -688,6 +783,9 @@ def test_unknown_liquidation_poisons_its_dependency_window():
                 "available_at": [
                     pd.NaT,
                 ],
+                "available_at_quality": [
+                    "unknown",
+                ],
             }
         )
     )
@@ -758,6 +856,7 @@ def test_migration_is_numerically_neutral_on_derived_semantics():
         legacy_columns
     ) | {
         "available_at",
+        "available_at_quality",
     }
 
     pdt.assert_frame_equal(
@@ -1010,6 +1109,9 @@ def test_late_liquidation_propagates_through_every_affected_row():
                 "available_at": [
                     late,
                 ],
+                "available_at_quality": [
+                    "derived",
+                ],
             }
         )
     )
@@ -1192,6 +1294,10 @@ def test_funding_known_before_row_becomes_usable_is_selected():
                 oi_available,
             ]
             * 3,
+            "available_at_quality": [
+                "derived",
+            ]
+            * 3,
         }
     )
 
@@ -1205,6 +1311,10 @@ def test_funding_known_before_row_becomes_usable_is_selected():
                 basis_available,
             ]
             * 3,
+            "available_at_quality": [
+                "derived",
+            ]
+            * 3,
         }
     )
 
@@ -1216,6 +1326,10 @@ def test_funding_known_before_row_becomes_usable_is_selected():
             "buy_sell_ratio": 1.25,
             "available_at": [
                 oi_available,
+            ]
+            * 3,
+            "available_at_quality": [
+                "derived",
             ]
             * 3,
         }
@@ -1258,6 +1372,10 @@ def test_funding_known_before_row_becomes_usable_is_selected():
                     tz="UTC",
                 ),
             ],
+            "available_at_quality": [
+                "derived",
+                "derived",
+            ],
         }
     )
 
@@ -1266,14 +1384,7 @@ def test_funding_known_before_row_becomes_usable_is_selected():
         funding_rate=funding,
         basis=basis,
         taker_flow=taker,
-        liquidations=pd.DataFrame(
-            {
-                "event_time": [],
-                "liquidation_side": [],
-                "liquidation_notional": [],
-                "available_at": [],
-            }
-        ),
+        liquidations=empty_liquidations(),
     )
 
     assert (

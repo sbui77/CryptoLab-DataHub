@@ -11,6 +11,7 @@ from cryptolab.config import (
 )
 from cryptolab.features.availability import (
     AVAILABLE_AT,
+    AVAILABLE_AT_QUALITY,
 )
 from cryptolab.features.derivatives import (
     build_derivatives_features,
@@ -137,11 +138,21 @@ def save_derivatives_features(
             "Cannot save empty derivatives dataset"
         )
 
-    if AVAILABLE_AT not in df.columns:
+    missing_contract = [
+        column
+        for column in (
+            AVAILABLE_AT,
+            AVAILABLE_AT_QUALITY,
+        )
+        if column not in df.columns
+    ]
+
+    if missing_contract:
         raise DerivativesFeaturePipelineError(
             "Derivatives feature artifact is missing "
-            "available_at; the point-in-time contract "
-            "must be persisted with the data"
+            f"{missing_contract}; the point-in-time "
+            "contract is a strict pair and must be "
+            "persisted with the data"
         )
 
     directory = (

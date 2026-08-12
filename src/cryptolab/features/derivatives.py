@@ -5,11 +5,18 @@ import pandas as pd
 
 from cryptolab.features.availability import (
     AVAILABLE_AT,
+    AVAILABLE_AT_QUALITY,
+    FeatureAvailabilityError,
+    availability_pair_state,
     combine_availability,
+    combine_availability_quality,
     extract_availability,
-    has_availability,
+    extract_availability_quality,
     pit_asof_indices,
+    quality_to_rank,
+    rank_to_quality,
     rolling_dependency_availability,
+    rolling_dependency_quality,
 )
 
 
@@ -21,9 +28,143 @@ LIQUIDATION_AVAILABILITY = (
     "_liquidation_available_at"
 )
 
+LIQUIDATION_AVAILABILITY_QUALITY = (
+    "_liquidation_available_at_quality"
+)
+
+LIQUIDATION_QUALITY_RANK = (
+    "_liquidation_quality_rank"
+)
+
 LIQUIDATION_EVENT_COUNT = (
     "_liquidation_event_count"
 )
+
+
+LIQUIDATION_INTERNAL_COLUMNS = [
+    LIQUIDATION_AVAILABILITY,
+    LIQUIDATION_AVAILABILITY_QUALITY,
+    LIQUIDATION_EVENT_COUNT,
+]
+
+
+def _contract_call(
+    function,
+    *args,
+    **kwargs,
+):
+    """
+    Run an availability-contract helper, normalizing its failure.
+
+    The helpers signal malformed metadata with
+    FeatureAvailabilityError, which is deliberately unrelated to
+    DerivativesFeatureError. A caller of derivatives.core should
+    only have to catch one exception type for malformed input, so
+    contract failures are re-raised here as
+    DerivativesFeatureError with the original preserved as the
+    cause.
+
+    This covers the partial metadata pair, invalid
+    available_at_quality labels, and violations of the
+    quality/available_at invariant.
+    """
+
+    try:
+        return function(
+            *args,
+            **kwargs,
+        )
+
+    except FeatureAvailabilityError as error:
+        raise DerivativesFeatureError(
+            str(error)
+        ) from error
+
+
+def _availability_pair(
+    frame: pd.DataFrame,
+    label: str,
+) -> bool:
+    """
+    Return whether a raw input participates in the availability
+    contract, rejecting partial metadata.
+
+    available_at and available_at_quality are one contract. A
+    frame carrying only one of them cannot be interpreted: an
+    availability timestamp with no recorded evidence quality is
+    indistinguishable from an exact one.
+    """
+
+    return _contract_call(
+        availability_pair_state,
+        frame,
+        label=label,
+    )
+
+
+def _availability_series(
+    frame: pd.DataFrame,
+    label: str,
+) -> pd.Series:
+    """
+    Return a validated availability series for a raw input.
+    """
+
+    return _contract_call(
+        extract_availability,
+        frame,
+        label=label,
+    )
+
+
+def _quality_series(
+    frame: pd.DataFrame,
+    label: str,
+    availability: pd.Series | None = None,
+) -> pd.Series:
+    """
+    Return a validated availability quality series for a raw
+    input, checked against its availability.
+    """
+
+    return _contract_call(
+        extract_availability_quality,
+        frame,
+        label=label,
+        availability=availability,
+    )
+
+
+def _validate_availability_metadata(
+    frame: pd.DataFrame,
+    label: str,
+) -> bool:
+    """
+    Return whether a raw input carries the availability contract,
+    validating the metadata whenever it is present.
+
+    Validation is deliberately independent of whether the caller
+    asked for propagation. Availability metadata that exists must
+    be internally valid even when this build discards it, because
+    consuming corrupt metadata silently here would carry it into
+    a later migration unnoticed.
+    """
+
+    carries = _availability_pair(
+        frame,
+        label,
+    )
+
+    if (
+        carries
+        and not frame.empty
+    ):
+        _quality_series(
+            frame,
+            label,
+        )
+
+    return carries
 
 
 # Longest trailing dependency window per raw input, expressed as
@@ -105,8 +246,10 @@ def _rolling_zscore(
 def _consumed_component(
     frame: pd.DataFrame,
     availability_column: str,
+    quality_column: str,
     matched_column: str,
 ) -> tuple[
+    pd.Series,
     pd.Series,
     pd.Series,
 ]:
@@ -118,6 +261,9 @@ def _consumed_component(
     carrying a null measurement still contributes its
     availability, and an unmatched candidate contributes
     nothing.
+
+    Availability and its evidence quality share one consumed
+    mask, because they describe the same observation.
     """
 
     consumed = (
@@ -128,6 +274,7 @@ def _consumed_component(
 
     return (
         frame[availability_column],
+        frame[quality_column],
         consumed,
     )
 
@@ -166,15 +313,16 @@ def aggregate_liquidations_5m(
         "liquidation_imbalance",
     ]
 
-    propagate_availability = has_availability(
-        df
+    propagate_availability = _availability_pair(
+        df,
+        "liquidations",
     )
 
     if propagate_availability:
-        columns = columns + [
-            LIQUIDATION_AVAILABILITY,
-            LIQUIDATION_EVENT_COUNT,
-        ]
+        columns = (
+            columns
+            + LIQUIDATION_INTERNAL_COLUMNS
+        )
 
     if df.empty:
         return pd.DataFrame(
@@ -289,6 +437,21 @@ def aggregate_liquidations_5m(
             errors="coerce",
         )
 
+        # Validates the pair invariant on the raw events, so the
+        # aggregated bar cannot inherit a quality label that
+        # contradicts its availability.
+        work[
+            "_quality_rank_i"
+        ] = quality_to_rank(
+            _quality_series(
+                work,
+                "liquidations",
+                availability=work[
+                    AVAILABLE_AT
+                ],
+            )
+        )
+
         work[
             "_event_i"
         ] = 1
@@ -319,6 +482,15 @@ def aggregate_liquidations_5m(
             LIQUIDATION_AVAILABILITY
         ] = (
             AVAILABLE_AT,
+            "max",
+        )
+
+        # Weakest link within the bar: the worst rank among the
+        # events the bar actually aggregated.
+        aggregations[
+            LIQUIDATION_QUALITY_RANK
+        ] = (
+            "_quality_rank_i",
             "max",
         )
 
@@ -362,6 +534,18 @@ def aggregate_liquidations_5m(
         ].where(
             ~incomplete,
             pd.NaT,
+        )
+
+        # An event with unknown availability carries the worst
+        # rank, so the bar decodes to unknown exactly where its
+        # availability was set to NaT above. A bar that
+        # aggregated no event has no rank and no quality.
+        result[
+            LIQUIDATION_AVAILABILITY_QUALITY
+        ] = rank_to_quality(
+            result[
+                LIQUIDATION_QUALITY_RANK
+            ]
         )
 
     result[
@@ -450,10 +634,39 @@ def build_derivatives_features(
         available_at = max(available_at of the observations
                            actually consumed by that row)
 
+    Availability evidence quality
+    -----------------------------
+    available_at_quality travels with available_at as a strict
+    pair and follows the weakest link:
+
+        available_at_quality
+            = worst quality among the observations actually
+              consumed by that row
+
+        exact < derived < unknown
+
+    It describes the evidence behind the availability timestamp
+    only. It is not completeness, and not confidence in the
+    numeric feature values.
+
     require_availability
-        None  - propagate when the spine carries available_at
+        None  - propagate when the spine carries the contract
         True  - require it and fail otherwise
-        False - skip availability propagation entirely
+        False - do not propagate availability metadata to the
+                output, which therefore carries neither
+                availability column
+
+    require_availability=False switches off PROPAGATION, not
+    VALIDATION. Availability metadata that is present on an input
+    must still be internally valid: a partial pair, an invalid
+    quality label or a quality/available_at contradiction is
+    rejected in every mode. Silently consuming corrupt metadata
+    would let it reach a later migration unnoticed.
+
+    Malformed availability metadata is reported as
+    DerivativesFeatureError regardless of which layer detected
+    it, with the underlying FeatureAvailabilityError preserved as
+    the cause.
 
     Availability is never synthesized from event time here. The
     raw storage layer owns that decision and records it via
@@ -465,11 +678,39 @@ def build_derivatives_features(
             "Open Interest dataset is empty"
         )
 
+    spine_contract = (
+        _validate_availability_metadata(
+            open_interest,
+            "open_interest",
+        )
+    )
+
+    # Metadata present on a joined input is validated whatever
+    # the mode. Liquidations are validated by their aggregation,
+    # which runs in both modes.
+    for label, frame in (
+        (
+            "basis",
+            basis,
+        ),
+        (
+            "taker_flow",
+            taker_flow,
+        ),
+        (
+            "funding_rate",
+            funding_rate,
+        ),
+    ):
+        if not frame.empty:
+            _validate_availability_metadata(
+                frame,
+                label,
+            )
+
     if require_availability is None:
         propagate_availability = (
-            has_availability(
-                open_interest
-            )
+            spine_contract
         )
     else:
         propagate_availability = bool(
@@ -478,9 +719,7 @@ def build_derivatives_features(
 
     if (
         propagate_availability
-        and not has_availability(
-            open_interest
-        )
+        and not spine_contract
     ):
         raise DerivativesFeatureError(
             "Open Interest spine is missing "
@@ -501,6 +740,7 @@ def build_derivatives_features(
     if propagate_availability:
         required_oi = required_oi + [
             AVAILABLE_AT,
+            AVAILABLE_AT_QUALITY,
         ]
 
     missing_oi = [
@@ -561,27 +801,40 @@ def build_derivatives_features(
         tuple[
             pd.Series,
             pd.Series,
+            pd.Series,
             int,
         ]
     ] = []
 
     if propagate_availability:
         spine_availability = (
-            extract_availability(
+            _availability_series(
                 result,
-                label="open_interest",
+                "open_interest",
+            )
+        )
+
+        spine_quality = (
+            _quality_series(
+                result,
+                "open_interest",
+                availability=(
+                    spine_availability
+                ),
             )
         )
 
         result = result.drop(
             columns=[
                 AVAILABLE_AT,
+                AVAILABLE_AT_QUALITY,
             ]
         )
 
         equality_components.append(
             (
                 spine_availability,
+                spine_quality,
                 pd.Series(
                     True,
                     index=result.index,
@@ -687,10 +940,22 @@ def build_derivatives_features(
             )
 
         if propagate_availability:
+            if not _availability_pair(
+                basis,
+                "basis",
+            ):
+                raise DerivativesFeatureError(
+                    "Basis is missing available_at while "
+                    "the Open Interest spine carries it; "
+                    "partial availability metadata cannot "
+                    "be reconciled"
+                )
+
             basis_columns = (
                 basis_columns
                 + [
                     AVAILABLE_AT,
+                    AVAILABLE_AT_QUALITY,
                 ]
             )
 
@@ -719,6 +984,11 @@ def build_derivatives_features(
                     AVAILABLE_AT: (
                         "_basis_available_at"
                     ),
+
+                    AVAILABLE_AT_QUALITY: (
+                        "_basis_available_at"
+                        "_quality"
+                    ),
                 }
             )
 
@@ -733,21 +1003,28 @@ def build_derivatives_features(
         )
 
         if propagate_availability:
-            values, consumed = (
-                _consumed_component(
-                    result,
-                    availability_column=(
-                        "_basis_available_at"
-                    ),
-                    matched_column=(
-                        "_basis_matched"
-                    ),
-                )
+            (
+                values,
+                quality,
+                consumed,
+            ) = _consumed_component(
+                result,
+                availability_column=(
+                    "_basis_available_at"
+                ),
+                quality_column=(
+                    "_basis_available_at"
+                    "_quality"
+                ),
+                matched_column=(
+                    "_basis_matched"
+                ),
             )
 
             equality_components.append(
                 (
                     values,
+                    quality,
                     consumed,
                     BASIS_DEPENDENCY_BARS,
                 )
@@ -756,6 +1033,8 @@ def build_derivatives_features(
             result = result.drop(
                 columns=[
                     "_basis_available_at",
+                    "_basis_available_at"
+                    "_quality",
                     "_basis_matched",
                 ]
             )
@@ -814,10 +1093,22 @@ def build_derivatives_features(
             )
 
         if propagate_availability:
+            if not _availability_pair(
+                taker_flow,
+                "taker_flow",
+            ):
+                raise DerivativesFeatureError(
+                    "Taker Flow is missing available_at "
+                    "while the Open Interest spine carries "
+                    "it; partial availability metadata "
+                    "cannot be reconciled"
+                )
+
             taker_columns = (
                 taker_columns
                 + [
                     AVAILABLE_AT,
+                    AVAILABLE_AT_QUALITY,
                 ]
             )
 
@@ -848,6 +1139,11 @@ def build_derivatives_features(
                     AVAILABLE_AT: (
                         "_taker_available_at"
                     ),
+
+                    AVAILABLE_AT_QUALITY: (
+                        "_taker_available_at"
+                        "_quality"
+                    ),
                 }
             )
         )
@@ -871,21 +1167,28 @@ def build_derivatives_features(
         )
 
         if propagate_availability:
-            values, consumed = (
-                _consumed_component(
-                    result,
-                    availability_column=(
-                        "_taker_available_at"
-                    ),
-                    matched_column=(
-                        "_taker_matched"
-                    ),
-                )
+            (
+                values,
+                quality,
+                consumed,
+            ) = _consumed_component(
+                result,
+                availability_column=(
+                    "_taker_available_at"
+                ),
+                quality_column=(
+                    "_taker_available_at"
+                    "_quality"
+                ),
+                matched_column=(
+                    "_taker_matched"
+                ),
             )
 
             equality_components.append(
                 (
                     values,
+                    quality,
                     consumed,
                     TAKER_DEPENDENCY_BARS,
                 )
@@ -894,6 +1197,8 @@ def build_derivatives_features(
             result = result.drop(
                 columns=[
                     "_taker_available_at",
+                    "_taker_available_at"
+                    "_quality",
                     "_taker_matched",
                 ]
             )
@@ -1025,8 +1330,9 @@ def build_derivatives_features(
     if (
         propagate_availability
         and not liquidations.empty
-        and not has_availability(
-            liquidations
+        and not _availability_pair(
+            liquidations,
+            "liquidations",
         )
     ):
         raise DerivativesFeatureError(
@@ -1053,9 +1359,8 @@ def build_derivatives_features(
             liquidation_5m[
                 [
                     "timestamp",
-                    LIQUIDATION_AVAILABILITY,
-                    LIQUIDATION_EVENT_COUNT,
                 ]
+                + LIQUIDATION_INTERNAL_COLUMNS
             ],
             on="timestamp",
             how="left",
@@ -1072,6 +1377,9 @@ def build_derivatives_features(
                     LIQUIDATION_AVAILABILITY
                 ],
                 aligned[
+                    LIQUIDATION_AVAILABILITY_QUALITY
+                ],
+                aligned[
                     LIQUIDATION_EVENT_COUNT
                 ]
                 .fillna(0)
@@ -1081,11 +1389,21 @@ def build_derivatives_features(
             )
         )
 
+    if not liquidation_5m.empty:
+        # Internal availability bookkeeping never reaches the
+        # output frame, in either mode.
         liquidation_5m = (
             liquidation_5m.drop(
                 columns=[
-                    LIQUIDATION_AVAILABILITY,
-                    LIQUIDATION_EVENT_COUNT,
+                    column
+                    for column in (
+                        LIQUIDATION_INTERNAL_COLUMNS
+                        + [
+                            LIQUIDATION_QUALITY_RANK,
+                        ]
+                    )
+                    if column
+                    in liquidation_5m.columns
                 ]
             )
         )
@@ -1105,7 +1423,14 @@ def build_derivatives_features(
 
     provisional_availability: pd.Series | None = None
 
+    provisional_quality: pd.Series | None = None
+
     funding_component: tuple[
+        pd.Series,
+        pd.Series,
+    ] | None = None
+
+    funding_quality_component: tuple[
         pd.Series,
         pd.Series,
     ] | None = None
@@ -1119,6 +1444,24 @@ def build_derivatives_features(
             )
             for (
                 values,
+                _quality,
+                consumed,
+                window,
+            ) in equality_components
+        ]
+
+        # Quality travels over exactly the same consumed windows
+        # as availability, so the two can never disagree about
+        # which observations a row depends on.
+        windowed_quality = [
+            rolling_dependency_quality(
+                quality,
+                consumed,
+                window,
+            )
+            for (
+                _values,
+                quality,
                 consumed,
                 window,
             ) in equality_components
@@ -1127,6 +1470,12 @@ def build_derivatives_features(
         provisional_availability = (
             combine_availability(
                 windowed
+            )
+        )
+
+        provisional_quality = (
+            combine_availability_quality(
+                windowed_quality
             )
         )
 
@@ -1155,10 +1504,22 @@ def build_derivatives_features(
             )
 
         if propagate_availability:
+            if not _availability_pair(
+                funding_rate,
+                "funding_rate",
+            ):
+                raise DerivativesFeatureError(
+                    "Funding is missing available_at while "
+                    "the Open Interest spine carries it; "
+                    "partial availability metadata cannot "
+                    "be reconciled"
+                )
+
             funding_columns = (
                 funding_columns
                 + [
                     AVAILABLE_AT,
+                    AVAILABLE_AT_QUALITY,
                 ]
             )
 
@@ -1195,11 +1556,23 @@ def build_derivatives_features(
         # arrived before the row became usable is not withheld.
         funding_availability = None
 
+        funding_quality = None
+
         if propagate_availability:
             funding_availability = (
-                extract_availability(
+                _availability_series(
                     funding_work,
-                    label="funding_rate",
+                    "funding_rate",
+                )
+            )
+
+            funding_quality = (
+                _quality_series(
+                    funding_work,
+                    "funding_rate",
+                    availability=(
+                        funding_availability
+                    ),
                 )
             )
 
@@ -1237,7 +1610,11 @@ def build_derivatives_features(
         payload_columns = [
             column
             for column in funding_columns
-            if column != AVAILABLE_AT
+            if column
+            not in {
+                AVAILABLE_AT,
+                AVAILABLE_AT_QUALITY,
+            }
         ]
 
         for column in payload_columns:
@@ -1266,6 +1643,25 @@ def build_derivatives_features(
 
             funding_component = (
                 taken_availability,
+                found_series,
+            )
+
+            # Only the selected candidate contributes its
+            # evidence quality. Candidates that were passed over
+            # -- including unknown ones, which are individually
+            # ineligible -- contribute nothing.
+            taken_quality = (
+                funding_quality
+                .iloc[safe_positions]
+                .reset_index(drop=True)
+            )
+
+            taken_quality.index = (
+                result.index
+            )
+
+            funding_quality_component = (
+                taken_quality,
                 found_series,
             )
 
@@ -1393,10 +1789,38 @@ def build_derivatives_features(
                 funding_component
             )
 
+        final_quality_components = [
+            (
+                provisional_quality,
+                pd.Series(
+                    True,
+                    index=result.index,
+                ),
+            ),
+        ]
+
+        if (
+            funding_quality_component
+            is not None
+        ):
+            final_quality_components.append(
+                funding_quality_component
+            )
+
         result[
             AVAILABLE_AT
         ] = combine_availability(
             final_components
+        )
+
+        # Weakest link over the same consumed set, so the pair
+        # invariant holds by construction:
+        #
+        #   quality == unknown  iff  available_at is NaT
+        result[
+            AVAILABLE_AT_QUALITY
+        ] = combine_availability_quality(
+            final_quality_components
         )
 
     # ========================================================

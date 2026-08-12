@@ -184,9 +184,111 @@ violations has been removed: late-arriving backfill is now
 handled by widening the dependency window rather than by
 rejecting the data.
 
+### Availability evidence quality
+
+Version: 0.3 (derivatives.core)
+
+`available_at_quality` records the evidence behind an
+availability timestamp, and nothing else. It is not data
+completeness, not a feature quality score, and not confidence in
+the numeric value of a feature.
+
+```text
+exact    directly observed by CryptoLab
+derived  deterministically inferred from source semantics
+unknown  cannot be reconstructed reliably
+```
+
+### Weakest-link propagation
+
+```text
+output available_at_quality
+    = worst quality among the observations actually consumed by
+      that output row
+
+exact < derived < unknown
+```
+
+Combination is a maximum over that ordering, so it is
+associative, commutative and idempotent, and therefore
+independent of join order.
+
+The quality of the observation that happens to determine
+`max(available_at)` is deliberately NOT used. Given
+
+```text
+A: available_at = 10:10, quality = exact
+B: available_at = 10:05, quality = derived
+```
+
+the output is `available_at = 10:10` with quality `derived`. The
+output timestamp is a function of every consumed observation:
+had B arrived later than its derived estimate, the true output
+availability would move. Calling it exact would claim direct
+observation of a bound that partly rests on inference.
+
+### Strict pair
+
+`available_at` and `available_at_quality` are one contract. A
+migrated artifact emits both or neither, and
+
+```text
+available_at_quality == "unknown"   iff   available_at is NaT
+```
+
+holds on inputs and on outputs. A frame carrying exactly one of
+the two columns is partial metadata and is rejected: an
+availability timestamp with no recorded evidence quality cannot
+be distinguished from an exact one. Legacy inputs
+(`require_availability=False`) emit neither column rather than a
+fabricated one.
+
+`require_availability=False` switches off *propagation*, not
+*validation*. Metadata that is present on an input must still be
+internally valid in every mode; only the output contract is
+withheld. Consuming corrupt metadata silently would carry it
+into a later migration unnoticed.
+
+Malformed availability metadata reaches the caller of
+`derivatives.core` as `DerivativesFeatureError` — partial pair,
+invalid label, or invariant violation alike — with the
+underlying `FeatureAvailabilityError` preserved as the cause.
+
+### Combining in stages
+
+The combination is associative, but "consumed nothing" is
+collapsed to `unknown` (and to `NaT` on the availability side)
+at the boundary of the combinator. An intermediate result must
+therefore not be re-injected as a component with
+`consumed=True` on rows where nothing was consumed: that turns
+*no dependency* into *unknown dependency*, and the staged result
+stops matching the flat combination. Fold only where at least
+one component is genuinely consumed, or carry the real consumed
+mask through the fold.
+
+### Windows, as-of selection and filtering
+
+Quality travels over exactly the same consumed observations as
+availability:
+
+- rolling and lagged dependencies take the worst quality over
+  the same trailing window, and an unknown observation outside
+  that window does not poison the row;
+- an unmatched join candidate contributes nothing, whatever its
+  quality;
+- the as-of funding candidate that is actually selected
+  contributes its own quality; candidates passed over contribute
+  nothing.
+
+Quality is audit and evidence metadata, not a causal filter. A
+row with a known `available_at` and quality `derived` stays
+usable under the canonical rule `available_at <= as_of_time`.
+`point_in_time_filter` is unchanged.
+
 ### Not yet defined
 
-`available_at_quality` is not propagated to feature outputs.
-Combining exact, derived and unknown qualities across multiple
-consumed inputs has no agreed rule yet, so no quality column is
-emitted rather than inventing one.
+Whether a *fallback* — an as-of selection that skipped a newer
+candidate because that candidate's availability was unprovable —
+needs its own column. Today such a row is indistinguishable from
+one where no newer candidate existed. This is recorded as
+migration debt, not addressed here.

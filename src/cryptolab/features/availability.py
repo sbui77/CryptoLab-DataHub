@@ -10,6 +10,54 @@ class FeatureAvailabilityError(RuntimeError):
 
 AVAILABLE_AT = "available_at"
 
+AVAILABLE_AT_QUALITY = "available_at_quality"
+
+
+QUALITY_EXACT = "exact"
+
+QUALITY_DERIVED = "derived"
+
+QUALITY_UNKNOWN = "unknown"
+
+
+# Weakest-link ordering of timestamp evidence:
+#
+#     exact < derived < unknown
+#
+# available_at_quality describes the EVIDENCE behind the
+# availability timestamp and nothing else. It is not data
+# completeness, not a feature quality score, and not confidence
+# in the numeric value of the feature.
+QUALITY_ORDER: tuple[
+    str,
+    ...
+] = (
+    QUALITY_EXACT,
+    QUALITY_DERIVED,
+    QUALITY_UNKNOWN,
+)
+
+VALID_QUALITIES = frozenset(
+    QUALITY_ORDER
+)
+
+
+_QUALITY_RANK: dict[
+    str,
+    int,
+] = {
+    quality: rank
+    for rank, quality in enumerate(
+        QUALITY_ORDER
+    )
+}
+
+_UNKNOWN_RANK = float(
+    _QUALITY_RANK[
+        QUALITY_UNKNOWN
+    ]
+)
+
 
 # Bound on the boolean work matrix used by point-in-time
 # selection. Rows are processed in chunks so memory stays flat
@@ -85,6 +133,284 @@ def extract_availability(
         utc=True,
         errors="coerce",
     )
+
+
+def has_availability_quality(
+    df: pd.DataFrame,
+) -> bool:
+    """
+    Return True when a frame carries the availability quality
+    column.
+    """
+
+    return (
+        AVAILABLE_AT_QUALITY
+        in df.columns
+    )
+
+
+def availability_pair_state(
+    df: pd.DataFrame,
+    *,
+    label: str,
+) -> bool:
+    """
+    Return whether a frame participates in the availability
+    contract.
+
+    The contract is a strict pair:
+
+        available_at
+        available_at_quality
+
+    True
+        Both columns are present.
+
+    False
+        Neither column is present. The frame predates the
+        contract and nothing is fabricated for it.
+
+    A frame carrying exactly one of the two columns is partial
+    metadata. It is rejected rather than silently downgraded,
+    because a timestamp with no recorded evidence quality cannot
+    be told apart from an exact one.
+    """
+
+    availability = has_availability(
+        df
+    )
+
+    quality = has_availability_quality(
+        df
+    )
+
+    if availability == quality:
+        return availability
+
+    present = (
+        AVAILABLE_AT
+        if availability
+        else AVAILABLE_AT_QUALITY
+    )
+
+    missing = (
+        AVAILABLE_AT_QUALITY
+        if availability
+        else AVAILABLE_AT
+    )
+
+    raise FeatureAvailabilityError(
+        "Partial point-in-time availability metadata for "
+        f"{label}: {present} is present but {missing} is "
+        "missing"
+    )
+
+
+def quality_to_rank(
+    values: pd.Series,
+) -> pd.Series:
+    """
+    Encode quality labels as weakest-link ranks.
+
+    Missing labels encode as NaN, which means "no evidence
+    recorded here" rather than any particular quality. Callers
+    decide what an absent label means in their context.
+    """
+
+    normalized = (
+        pd.Series(
+            values
+        )
+        .astype("string")
+        .str.strip()
+        .str.lower()
+    )
+
+    unrecognized = (
+        normalized.notna()
+        & ~normalized.isin(
+            VALID_QUALITIES
+        )
+    )
+
+    if unrecognized.any():
+        invalid = sorted(
+            set(
+                normalized[
+                    unrecognized
+                ].tolist()
+            )
+        )
+
+        raise FeatureAvailabilityError(
+            "Invalid available_at_quality values: "
+            f"{invalid}"
+        )
+
+    ranks = pd.Series(
+        np.nan,
+        index=normalized.index,
+        dtype="float64",
+    )
+
+    for (
+        quality,
+        rank,
+    ) in _QUALITY_RANK.items():
+        selected = (
+            normalized
+            .eq(quality)
+            .fillna(False)
+            .astype(bool)
+        )
+
+        ranks.loc[
+            selected
+        ] = float(
+            rank
+        )
+
+    return ranks
+
+
+def rank_to_quality(
+    ranks: pd.Series,
+) -> pd.Series:
+    """
+    Decode weakest-link ranks back into quality labels.
+
+    NaN decodes to pd.NA, preserving "no evidence recorded".
+    """
+
+    result = pd.Series(
+        pd.NA,
+        index=ranks.index,
+        dtype="string",
+    )
+
+    for (
+        quality,
+        rank,
+    ) in _QUALITY_RANK.items():
+        selected = (
+            ranks
+            .eq(float(rank))
+            .fillna(False)
+            .astype(bool)
+        )
+
+        result.loc[
+            selected
+        ] = quality
+
+    unmapped = (
+        ranks.notna()
+        & result.isna()
+    )
+
+    if unmapped.any():
+        raise FeatureAvailabilityError(
+            "Unmappable availability quality ranks: "
+            f"{sorted(set(ranks[unmapped].tolist()))}"
+        )
+
+    return result
+
+
+def extract_availability_quality(
+    df: pd.DataFrame,
+    *,
+    label: str,
+    availability: pd.Series | None = None,
+) -> pd.Series:
+    """
+    Return the availability quality series of an input frame.
+
+    Missing quality is never fabricated: a frame that declares
+    the column must populate it on every row.
+
+    Pair invariant
+    --------------
+    Availability and its evidence quality are two views of one
+    fact, so they must agree:
+
+        available_at_quality == "unknown"
+            iff
+        available_at is NaT
+
+    Both directions are enforced. A known timestamp labelled
+    unknown would be discarded by point-in-time selection that
+    trusted the label, and an unknown timestamp labelled exact
+    would claim evidence that does not exist.
+    """
+
+    if not has_availability_quality(
+        df
+    ):
+        raise FeatureAvailabilityError(
+            "Missing available_at_quality for input: "
+            f"{label}"
+        )
+
+    values = (
+        df[AVAILABLE_AT_QUALITY]
+        .astype("string")
+        .str.strip()
+        .str.lower()
+    )
+
+    invalid = (
+        values.isna()
+        | ~values.isin(
+            VALID_QUALITIES
+        )
+    )
+
+    if invalid.any():
+        raise FeatureAvailabilityError(
+            "Invalid available_at_quality for input "
+            f"{label}: "
+            f"{sorted(set(values[invalid].astype(object)))}"
+        )
+
+    if (
+        availability is None
+        and has_availability(
+            df
+        )
+    ):
+        availability = extract_availability(
+            df,
+            label=label,
+        )
+
+    if availability is not None:
+        unknown = values.eq(
+            QUALITY_UNKNOWN
+        )
+
+        missing = availability.isna()
+
+        if (
+            unknown
+            & ~missing
+        ).any():
+            raise FeatureAvailabilityError(
+                "available_at_quality='unknown' requires "
+                f"available_at=NaT for input: {label}"
+            )
+
+        if (
+            ~unknown
+            & missing
+        ).any():
+            raise FeatureAvailabilityError(
+                "available_at=NaT requires "
+                "available_at_quality='unknown' for input: "
+                f"{label}"
+            )
+
+    return values
 
 
 def combine_availability(
@@ -175,6 +501,121 @@ def combine_availability(
     return pd.to_datetime(
         combined,
         utc=True,
+    )
+
+
+def combine_availability_quality(
+    components: list[
+        tuple[
+            pd.Series,
+            pd.Series,
+        ]
+    ],
+) -> pd.Series:
+    """
+    Combine consumed input quality into output quality.
+
+    Canonical rule (weakest link):
+
+        output available_at_quality
+            = worst quality among the observations that actually
+              contributed to that output row
+
+    with
+
+        exact < derived < unknown
+
+    Combination is a maximum over ranks, so it is associative,
+    commutative and idempotent, and therefore independent of
+    join order.
+
+    The quality of the observation that happens to determine
+    max(available_at) is deliberately NOT used. The output
+    timestamp is a function of every consumed observation, so it
+    cannot be called exact while any of them was merely derived.
+
+    Each component is a pair:
+
+        (quality values, consumed mask)
+
+    consumed = False
+        The observation did not contribute, so it is ignored
+        entirely — including when its quality is unknown.
+
+    consumed = True with no recorded quality
+        Contributing with no evidence at all is exactly what
+        unknown means, so the weakest link takes it as unknown.
+
+    A row that consumed nothing has no established availability,
+    so its quality is unknown. This mirrors the NaT that
+    combine_availability produces for the same row.
+
+    Combining in stages
+    -------------------
+    The binary operation is associative, but the "consumed
+    nothing" outcome is collapsed to unknown at the boundary of
+    this function. An intermediate result must therefore NOT be
+    re-injected as a component with consumed=True on rows where
+    nothing was actually consumed: that turns "no dependency"
+    into "unknown dependency" and the staged result stops
+    matching the single flat combination.
+
+    combine_availability has the identical property, since its
+    "consumed nothing" outcome collapses to NaT and poisons the
+    row when re-injected as consumed. Fold only where at least
+    one component is genuinely consumed, or carry the real
+    consumed mask through the fold.
+    """
+
+    if not components:
+        raise FeatureAvailabilityError(
+            "At least one quality component is required"
+        )
+
+    effective: list[pd.Series] = []
+
+    for (
+        values,
+        consumed,
+    ) in components:
+        ranks = quality_to_rank(
+            values
+        )
+
+        consumed_mask = consumed.astype(
+            bool
+        )
+
+        ranks = ranks.where(
+            ~(
+                consumed_mask
+                & ranks.isna()
+            ),
+            _UNKNOWN_RANK,
+        )
+
+        effective.append(
+            ranks.where(
+                consumed_mask
+            )
+        )
+
+    frame = pd.concat(
+        effective,
+        axis=1,
+    )
+
+    worst = frame.max(
+        axis=1,
+        skipna=True,
+    )
+
+    worst = worst.fillna(
+        _UNKNOWN_RANK
+    )
+
+    return rank_to_quality(
+        worst
     )
 
 
@@ -341,6 +782,94 @@ def rolling_dependency_availability(
 
     return (
         result,
+        rolled_consumed,
+    )
+
+
+def rolling_dependency_quality(
+    values: pd.Series,
+    consumed: pd.Series,
+    window: int,
+) -> tuple[
+    pd.Series,
+    pd.Series,
+]:
+    """
+    Extend a quality component across the trailing window of
+    observations a rolling or lagged feature consumes.
+
+    Quality travels over exactly the same window as availability,
+    because it describes the evidence behind exactly the same
+    consumed observations. A feature at row t computed from
+    observations t-(window-1) .. t carries the worst quality over
+    that window.
+
+    Semantics preserved from combine_availability_quality
+    -----------------------------------------------------
+    An observation that was not consumed contributes nothing,
+    even if it falls inside the window.
+
+    An unknown observation degrades the dependency only for the
+    rows whose window actually contains it. Outside the window it
+    must not poison the row.
+
+    Returns
+    -------
+    (windowed quality, windowed consumed mask) suitable for
+    passing straight to combine_availability_quality.
+    """
+
+    if window < 1:
+        raise FeatureAvailabilityError(
+            "Rolling dependency window must be >= 1"
+        )
+
+    ranks = quality_to_rank(
+        values
+    )
+
+    consumed_mask = consumed.astype(
+        bool
+    )
+
+    ranks = ranks.where(
+        ~(
+            consumed_mask
+            & ranks.isna()
+        ),
+        _UNKNOWN_RANK,
+    )
+
+    effective = ranks.where(
+        consumed_mask
+    )
+
+    # Ranks are small integers, so the float64 path pandas uses
+    # for rolling aggregation represents them exactly.
+    rolled = (
+        effective
+        .rolling(
+            window,
+            min_periods=1,
+        )
+        .max()
+    )
+
+    rolled_consumed = (
+        consumed_mask
+        .astype("int64")
+        .rolling(
+            window,
+            min_periods=1,
+        )
+        .max()
+        > 0
+    )
+
+    return (
+        rank_to_quality(
+            rolled
+        ),
         rolled_consumed,
     )
 
