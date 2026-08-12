@@ -725,6 +725,7 @@ A task reaches READY_FOR_HUMAN_REVIEW only when:
 - no unauthorized policy mutation occurred;
 - no unauthorized Git integration action occurred;
 - runtime status accurately represents completed work;
+- runtime status passes internal structural and invariant validation;
 - current report accurately summarizes the task.
 
 For ordinary implementation tasks, PASS is expected for targeted tests
@@ -868,6 +869,77 @@ authority.
 
 ---
 
+## 24A. Runtime structural and invariant validation
+
+`statusctl` enforces the runtime v2 contract internally using only the
+Python standard library.
+
+This enforcement complements the declarative JSON Schema at:
+
+    .claude/schemas/status.schema.json
+
+The canonical load path is fail-closed:
+
+    read status.json
+      ↓
+    parse JSON
+      ↓
+    validate structure and cross-field invariants
+      ↓
+    only valid state may be returned
+
+If an existing canonical runtime state is invalid, `statusctl` must
+stop rather than continue a transition from corrupted or unsupported
+state.
+
+The canonical save path is also fail-closed:
+
+    construct candidate state
+      ↓
+    set updated_at
+      ↓
+    validate structure and cross-field invariants
+      ↓
+    only valid candidate may replace status.json
+      ↓
+    regenerate the report
+
+Validation must occur before canonical `status.json` is replaced.
+
+Required enforcement includes:
+
+- exact supported top-level fields and runtime constants;
+- valid states, phases, test records, Human Gates, and gate decisions;
+- valid gate-ID format and timezone-aware timestamps;
+- PASS/FAIL tests require a non-empty command and summary;
+- NOT_REQUIRED tests require `command=null` and a non-empty reason;
+- IDLE contains no active task state;
+- RUNNING has no active Human Gate or completion timestamp;
+- BLOCKED_HUMAN_DECISION requires an active Human Gate and no completion
+  timestamp;
+- states other than BLOCKED_HUMAN_DECISION have no active Human Gate;
+- READY_FOR_HUMAN_REVIEW requires FINAL_VERIFY, a completion timestamp,
+  and targeted/full results satisfying PASS or justified NOT_REQUIRED;
+- FAILED requires a completion timestamp.
+
+If validation rejects a candidate transition:
+
+- the command must fail;
+- canonical `status.json` must remain unchanged;
+- no success audit event may be appended for the rejected transition;
+- the canonical report must not be regenerated for that rejected
+  transition.
+
+A validation failure is not authorization to manually repair or bypass
+runtime state.
+
+Schema version remains `2.0` unless a genuine runtime data-format
+migration is separately approved. Stricter enforcement of already
+intended v2 invariants does not by itself require a schema-version
+change.
+
+---
+
 ## 25. Authority hierarchy
 
 When deciding whether an action is permitted, apply this order:
@@ -918,6 +990,9 @@ Human Gate decisions must identify the exact active gate ID.
 
 Runtime state-changing operations must pass through the serialized
 `statusctl` controller.
+
+Runtime state loaded or written by the controller must pass internal
+structural and invariant validation.
 
 The autonomous system may bring work to a decision boundary.
 

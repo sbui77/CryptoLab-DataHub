@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import re
 import subprocess
 import tempfile
 import time
@@ -60,6 +61,28 @@ READY_TEST_RESULTS = {
     "NOT_REQUIRED",
 }
 
+VALID_STATES = {
+    "IDLE",
+    "RUNNING",
+    "BLOCKED_HUMAN_DECISION",
+    "READY_FOR_HUMAN_REVIEW",
+    "FAILED",
+}
+
+VALID_GATE_DECISIONS = {
+    "APPROVED",
+    "ALTERNATIVE",
+    "REJECTED",
+}
+
+TOP_LEVEL_KEYS = {
+    "schema_version", "project", "state", "task_id", "task_title",
+    "phase", "branch", "started_at", "updated_at", "completed_at",
+    "tests", "human_gate", "last_gate_decision", "report",
+}
+
+GATE_ID_RE = re.compile(r"^HG-[0-9]{8}-[0-9]{3,}$")
+
 
 def now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -113,6 +136,213 @@ def control_lock():
             )
 
 
+def validation_error(message):
+    raise SystemExit(f"Runtime state validation failed: {message}")
+
+
+def require_exact_keys(value, expected, label):
+    if not isinstance(value, dict):
+        validation_error(f"{label} must be an object.")
+    actual = set(value)
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if missing:
+        validation_error(
+            f"{label} is missing required keys: {', '.join(missing)}"
+        )
+    if extra:
+        validation_error(
+            f"{label} contains unsupported keys: {', '.join(extra)}"
+        )
+
+
+def require_non_empty_string(value, label):
+    if not isinstance(value, str) or not value.strip():
+        validation_error(f"{label} must be a non-empty string.")
+
+
+def require_nullable_string(value, label):
+    if value is not None and not isinstance(value, str):
+        validation_error(f"{label} must be a string or null.")
+
+
+def require_timestamp(value, label, nullable=False):
+    if value is None:
+        if nullable:
+            return
+        validation_error(
+            f"{label} must be a valid timezone-aware date-time."
+        )
+    if not isinstance(value, str):
+        validation_error(f"{label} must be a date-time string.")
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        validation_error(
+            f"{label} is not a valid ISO-8601 date-time: {value}"
+        )
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        validation_error(f"{label} must include timezone information.")
+
+
+def require_gate_id(value, label):
+    if not isinstance(value, str) or not GATE_ID_RE.fullmatch(value):
+        validation_error(f"{label} must match HG-YYYYMMDD-NNN.")
+
+
+def validate_string_list(value, label):
+    if not isinstance(value, list):
+        validation_error(f"{label} must be an array.")
+    for index, item in enumerate(value):
+        if not isinstance(item, str):
+            validation_error(f"{label}[{index}] must be a string.")
+
+
+def validate_test_result(result, label):
+    if result is None:
+        return
+    require_exact_keys(result, {"command", "result", "summary"}, label)
+    require_non_empty_string(result["summary"], f"{label}.summary")
+    outcome = result["result"]
+    if outcome in {"PASS", "FAIL"}:
+        require_non_empty_string(result["command"], f"{label}.command")
+    elif outcome == "NOT_REQUIRED":
+        if result["command"] is not None:
+            validation_error(
+                f"{label}.command must be null when result is NOT_REQUIRED."
+            )
+    else:
+        validation_error(
+            f"{label}.result must be PASS, FAIL, or NOT_REQUIRED."
+        )
+
+
+def validate_human_gate(gate):
+    if gate is None:
+        return
+    require_exact_keys(
+        gate,
+        {
+            "gate_id", "type", "question", "recommendation",
+            "alternatives", "risks", "opened_at",
+        },
+        "human_gate",
+    )
+    require_gate_id(gate["gate_id"], "human_gate.gate_id")
+    if gate["type"] not in VALID_GATE_TYPES:
+        validation_error(f"human_gate.type is invalid: {gate['type']}")
+    require_non_empty_string(gate["question"], "human_gate.question")
+    require_non_empty_string(
+        gate["recommendation"], "human_gate.recommendation"
+    )
+    validate_string_list(gate["alternatives"], "human_gate.alternatives")
+    validate_string_list(gate["risks"], "human_gate.risks")
+    require_timestamp(gate["opened_at"], "human_gate.opened_at")
+
+
+def validate_gate_decision(decision):
+    if decision is None:
+        return
+    require_exact_keys(
+        decision,
+        {"gate_id", "decision", "resolved_at", "record"},
+        "last_gate_decision",
+    )
+    require_gate_id(decision["gate_id"], "last_gate_decision.gate_id")
+    if decision["decision"] not in VALID_GATE_DECISIONS:
+        validation_error(
+            "last_gate_decision.decision is invalid: "
+            f"{decision['decision']}"
+        )
+    require_timestamp(
+        decision["resolved_at"], "last_gate_decision.resolved_at"
+    )
+    require_non_empty_string(decision["record"], "last_gate_decision.record")
+
+
+def validate_runtime_state(data):
+    require_exact_keys(data, TOP_LEVEL_KEYS, "runtime status")
+
+    if data["schema_version"] != "2.0":
+        validation_error('schema_version must be "2.0".')
+    if data["project"] != "CryptoLab-DataHub":
+        validation_error('project must be "CryptoLab-DataHub".')
+    if data["report"] != REPORT:
+        validation_error(f"report must be {REPORT!r}.")
+    if data["state"] not in VALID_STATES:
+        validation_error(f"state is invalid: {data['state']}")
+    if data["phase"] is not None and data["phase"] not in VALID_PHASES:
+        validation_error(f"phase is invalid: {data['phase']}")
+
+    require_nullable_string(data["task_id"], "task_id")
+    require_nullable_string(data["task_title"], "task_title")
+    require_nullable_string(data["branch"], "branch")
+    require_timestamp(data["started_at"], "started_at", nullable=True)
+    require_timestamp(data["updated_at"], "updated_at", nullable=True)
+    require_timestamp(data["completed_at"], "completed_at", nullable=True)
+
+    require_exact_keys(data["tests"], {"targeted", "full"}, "tests")
+    validate_test_result(data["tests"]["targeted"], "tests.targeted")
+    validate_test_result(data["tests"]["full"], "tests.full")
+    validate_human_gate(data["human_gate"])
+    validate_gate_decision(data["last_gate_decision"])
+
+    state = data["state"]
+    if state == "IDLE":
+        nullable_fields = (
+            "task_id", "task_title", "phase", "branch", "started_at",
+            "updated_at", "completed_at", "human_gate", "last_gate_decision",
+        )
+        for field in nullable_fields:
+            if data[field] is not None:
+                validation_error(f"IDLE requires {field}=null.")
+        if data["tests"]["targeted"] is not None or data["tests"]["full"] is not None:
+            validation_error("IDLE requires all test results to be null.")
+        return
+
+    require_non_empty_string(data["task_id"], "task_id")
+    require_non_empty_string(data["task_title"], "task_title")
+    if data["phase"] is None:
+        validation_error(f"{state} requires a non-null phase.")
+    require_timestamp(data["started_at"], "started_at")
+    require_timestamp(data["updated_at"], "updated_at")
+
+    if state == "BLOCKED_HUMAN_DECISION":
+        if data["human_gate"] is None:
+            validation_error(
+                "BLOCKED_HUMAN_DECISION requires an active human_gate."
+            )
+        if data["completed_at"] is not None:
+            validation_error(
+                "BLOCKED_HUMAN_DECISION requires completed_at=null."
+            )
+    elif data["human_gate"] is not None:
+        validation_error(f"{state} requires human_gate=null.")
+
+    if state == "RUNNING":
+        if data["completed_at"] is not None:
+            validation_error("RUNNING requires completed_at=null.")
+    elif state == "READY_FOR_HUMAN_REVIEW":
+        require_timestamp(data["completed_at"], "completed_at")
+        if data["phase"] != "FINAL_VERIFY":
+            validation_error(
+                "READY_FOR_HUMAN_REVIEW requires phase=FINAL_VERIFY."
+            )
+        if not test_is_ready(data["tests"]["targeted"]):
+            validation_error(
+                "READY_FOR_HUMAN_REVIEW requires targeted test PASS "
+                "or justified NOT_REQUIRED."
+            )
+        if not test_is_ready(data["tests"]["full"]):
+            validation_error(
+                "READY_FOR_HUMAN_REVIEW requires full test PASS "
+                "or justified NOT_REQUIRED."
+            )
+    elif state == "FAILED":
+        require_timestamp(data["completed_at"], "completed_at")
+
+
 def git_output(args):
     try:
         return subprocess.check_output(
@@ -141,7 +371,7 @@ def working_tree():
 
 
 def idle_state():
-    return {
+    data = {
         "schema_version": "2.0",
         "project": "CryptoLab-DataHub",
         "state": "IDLE",
@@ -161,17 +391,23 @@ def idle_state():
         "report": REPORT,
     }
 
+    validate_runtime_state(data)
+    return data
+
 
 def load():
     if not STATUS.exists():
         return idle_state()
 
     try:
-        return json.loads(STATUS.read_text())
+        data = json.loads(STATUS.read_text())
     except json.JSONDecodeError as exc:
         raise SystemExit(
             f"Invalid status JSON: {STATUS}: {exc}"
         ) from exc
+
+    validate_runtime_state(data)
+    return data
 
 
 def format_test(name, result):
@@ -360,6 +596,7 @@ def render_report(data):
         f"- **Canonical report:** `{REPORT}`",
         f"- **Human Gate open:** {'YES' if gate else 'NO'}",
         f"- **statusctl lock:** `{LOCK_PATH}`",
+        "- **Runtime validation:** ENFORCED",
         "",
         "## Recommended next action",
         "",
@@ -376,6 +613,8 @@ def render_report(data):
 
 def save(data):
     data["updated_at"] = now()
+
+    validate_runtime_state(data)
 
     STATUS.parent.mkdir(
         parents=True,
