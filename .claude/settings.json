@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+
+  "permissions": {
+    "disableBypassPermissionsMode": "disable",
+
+    "allow": [
+      "Bash(PYTHONPATH=src .venv/bin/python -m pytest *)",
+      "Bash(.venv/bin/python -m pytest *)",
+      "Bash(.venv/bin/python -m py_compile *)",
+      "Bash(.venv/bin/python -m compileall *)",
+
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(git branch --show-current)",
+      "Bash(git ls-files *)",
+      "Bash(git grep *)",
+
+      "Bash(./.claude/bin/statusctl show)",
+      "Bash(./.claude/bin/statusctl report)",
+      "Bash(./.claude/bin/statusctl start *)",
+      "Bash(./.claude/bin/statusctl phase *)",
+      "Bash(./.claude/bin/statusctl test *)",
+      "Bash(./.claude/bin/statusctl test-not-required *)",
+      "Bash(./.claude/bin/statusctl gate open *)",
+      "Bash(./.claude/bin/statusctl ready)",
+      "Bash(./.claude/bin/statusctl fail *)"
+    ],
+
+    "ask": [
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git merge *)",
+      "Bash(git cherry-pick *)",
+      "Bash(git rebase *)",
+      "Bash(git switch *)",
+      "Bash(git checkout *)",
+      "Bash(git worktree *)",
+      "Bash(git branch -d *)",
+      "Bash(git branch -D *)",
+      "Bash(git tag *)",
+
+      "Bash(pip install *)",
+      "Bash(python -m pip install *)",
+      "Bash(.venv/bin/python -m pip install *)",
+
+      "Edit(./requirements.txt)",
+      "Edit(./pyproject.toml)",
+      "Edit(./data/**)"
+    ],
+
+    "deny": [
+      "Bash(./.claude/bin/statusctl gate approve *)",
+      "Bash(./.claude/bin/statusctl gate alternative *)",
+      "Bash(./.claude/bin/statusctl gate reject *)",
+
+      "Bash(git push --force*)",
+      "Bash(git reset --hard *)",
+      "Bash(git clean *)",
+      "Bash(rm -rf *)",
+      "Bash(rm -fr *)",
+      "Bash(sudo *)",
+
+      "Read(./.env)",
+      "Read(./secrets/**)",
+
+      "Edit(./.git/**)",
+      "Edit(./.claude/**)",
+      "Edit(./CLAUDE.md)",
+      "Edit(./CLAUDE.local.md)"
+    ]
+  },
+
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false,
+
+    "excludedCommands": [
+      "./.claude/bin/statusctl *"
+    ],
+
+    "filesystem": {
+      "denyWrite": [
+        "./.git",
+        "./.claude",
+        "./CLAUDE.md",
+        "./CLAUDE.local.md"
+      ],
+
+      "denyRead": [
+        "./.env",
+        "./secrets",
+        "~/.ssh",
+        "~/.aws",
+        "~/.gnupg",
+        "~/.claude/.credentials.json"
+      ]
+    }
+  }
+}

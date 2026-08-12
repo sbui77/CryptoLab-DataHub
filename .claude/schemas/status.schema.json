@@ -1,0 +1,278 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cryptolab-claude-status-v2",
+  "title": "CryptoLab Claude Runtime Status",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project",
+    "state",
+    "task_id",
+    "task_title",
+    "phase",
+    "branch",
+    "started_at",
+    "updated_at",
+    "completed_at",
+    "tests",
+    "human_gate",
+    "last_gate_decision",
+    "report"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "2.0"
+    },
+    "project": {
+      "const": "CryptoLab-DataHub"
+    },
+    "state": {
+      "enum": [
+        "IDLE",
+        "RUNNING",
+        "BLOCKED_HUMAN_DECISION",
+        "READY_FOR_HUMAN_REVIEW",
+        "FAILED"
+      ]
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_title": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "phase": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        null,
+        "ANALYZE",
+        "IMPLEMENT",
+        "TARGETED_TEST",
+        "FULL_TEST",
+        "ADVERSARIAL_REVIEW",
+        "CORRECT_FINDINGS",
+        "RETEST",
+        "FINAL_VERIFY"
+      ]
+    },
+    "branch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "started_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "completed_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "targeted",
+        "full"
+      ],
+      "properties": {
+        "targeted": {
+          "$ref": "#/$defs/testResult"
+        },
+        "full": {
+          "$ref": "#/$defs/testResult"
+        }
+      }
+    },
+    "human_gate": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/humanGate"
+        }
+      ]
+    },
+    "last_gate_decision": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/gateDecision"
+        }
+      ]
+    },
+    "report": {
+      "const": ".claude/runtime/latest_report.md"
+    }
+  },
+  "$defs": {
+    "testResult": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "command",
+            "result",
+            "summary"
+          ],
+          "properties": {
+            "command": {
+              "type": "string",
+              "minLength": 1
+            },
+            "result": {
+              "enum": [
+                "PASS",
+                "FAIL"
+              ]
+            },
+            "summary": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "command",
+            "result",
+            "summary"
+          ],
+          "properties": {
+            "command": {
+              "type": "null"
+            },
+            "result": {
+              "const": "NOT_REQUIRED"
+            },
+            "summary": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "humanGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gate_id",
+        "type",
+        "question",
+        "recommendation",
+        "alternatives",
+        "risks",
+        "opened_at"
+      ],
+      "properties": {
+        "gate_id": {
+          "type": "string",
+          "pattern": "^HG-[0-9]{8}-[0-9]{3,}$"
+        },
+        "type": {
+          "enum": [
+            "GIT_INTEGRATION",
+            "DEPENDENCY_CHANGE",
+            "DATA_MUTATION",
+            "SECURITY_AUTH",
+            "OS_CHANGE",
+            "SEMANTIC_DECISION",
+            "ARCHITECTURE_DECISION",
+            "SCOPE_EXPANSION",
+            "UNRESOLVED_DISCUSS",
+            "OTHER"
+          ]
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1
+        },
+        "recommendation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "alternatives": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "risks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "opened_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "gateDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gate_id",
+        "decision",
+        "resolved_at",
+        "record"
+      ],
+      "properties": {
+        "gate_id": {
+          "type": "string",
+          "pattern": "^HG-[0-9]{8}-[0-9]{3,}$"
+        },
+        "decision": {
+          "enum": [
+            "APPROVED",
+            "ALTERNATIVE",
+            "REJECTED"
+          ]
+        },
+        "resolved_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "record": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

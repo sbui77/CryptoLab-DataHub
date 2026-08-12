@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code local runtime state
+# Policy, schemas, templates and statusctl remain tracked.
+# Task state, audit history and generated reports are machine-local runtime data.
+.claude/runtime/

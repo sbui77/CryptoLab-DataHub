@@ -1,0 +1,808 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+STATUS = ROOT / ".claude/runtime/status.json"
+AUDIT = ROOT / ".claude/runtime/audit.jsonl"
+REPORT_PATH = ROOT / ".claude/runtime/latest_report.md"
+REPORT = ".claude/runtime/latest_report.md"
+
+VALID_PHASES = {
+    "ANALYZE",
+    "IMPLEMENT",
+    "TARGETED_TEST",
+    "FULL_TEST",
+    "ADVERSARIAL_REVIEW",
+    "CORRECT_FINDINGS",
+    "RETEST",
+    "FINAL_VERIFY",
+}
+
+VALID_GATE_TYPES = {
+    "GIT_INTEGRATION",
+    "DEPENDENCY_CHANGE",
+    "DATA_MUTATION",
+    "SECURITY_AUTH",
+    "OS_CHANGE",
+    "SEMANTIC_DECISION",
+    "ARCHITECTURE_DECISION",
+    "SCOPE_EXPANSION",
+    "UNRESOLVED_DISCUSS",
+    "OTHER",
+}
+
+READY_TEST_RESULTS = {
+    "PASS",
+    "NOT_REQUIRED",
+}
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def git_output(args):
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def branch():
+    value = git_output(["branch", "--show-current"])
+    return value or None
+
+
+def head():
+    value = git_output(["log", "-1", "--oneline"])
+    return value or "UNKNOWN"
+
+
+def working_tree():
+    value = git_output(["status", "--short"])
+    return value or "clean"
+
+
+def idle_state():
+    return {
+        "schema_version": "2.0",
+        "project": "CryptoLab-DataHub",
+        "state": "IDLE",
+        "task_id": None,
+        "task_title": None,
+        "phase": None,
+        "branch": None,
+        "started_at": None,
+        "updated_at": None,
+        "completed_at": None,
+        "tests": {
+            "targeted": None,
+            "full": None,
+        },
+        "human_gate": None,
+        "last_gate_decision": None,
+        "report": REPORT,
+    }
+
+
+def load():
+    if not STATUS.exists():
+        return idle_state()
+
+    try:
+        return json.loads(STATUS.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"Invalid status JSON: {STATUS}: {exc}"
+        ) from exc
+
+
+def format_test(name, result):
+    title = "Targeted" if name == "targeted" else "Full suite"
+
+    if not result:
+        return [
+            f"### {title}",
+            "",
+            "- **Result:** NOT RECORDED",
+        ]
+
+    command = result.get("command")
+    command_text = f"`{command}`" if command else "NOT APPLICABLE"
+
+    return [
+        f"### {title}",
+        "",
+        f"- **Result:** {result.get('result', 'UNKNOWN')}",
+        f"- **Command:** {command_text}",
+        f"- **Summary:** {result.get('summary', '')}",
+    ]
+
+
+def recommended_action(data):
+    state = data.get("state")
+
+    if state == "BLOCKED_HUMAN_DECISION":
+        gate = data.get("human_gate") or {}
+        gate_id = gate.get("gate_id", "UNKNOWN")
+        return (
+            f"Human decision required for `{gate_id}`. "
+            "Claude must not resolve this gate."
+        )
+
+    if state == "READY_FOR_HUMAN_REVIEW":
+        return (
+            "Review the completed work and decide whether "
+            "to perform the gated Git integration action."
+        )
+
+    if state == "FAILED":
+        return (
+            "Review the failure record and decide whether to start "
+            "a new task or revise the approved scope."
+        )
+
+    if state == "RUNNING":
+        return (
+            "Continue the approved autonomous workflow unless a "
+            "Human Gate is reached."
+        )
+
+    if state == "IDLE":
+        return "Start an approved task when ready."
+
+    return "Review the current runtime state."
+
+
+def render_report(data):
+    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    tests = data.get("tests") or {}
+    gate = data.get("human_gate")
+    last_decision = data.get("last_gate_decision")
+
+    lines = [
+        "# CryptoLab Autonomous Task Report",
+        "",
+        "## Runtime",
+        "",
+        f"- **Task ID:** {data.get('task_id') or 'NONE'}",
+        f"- **Title:** {data.get('task_title') or 'NONE'}",
+        f"- **State:** {data.get('state') or 'UNKNOWN'}",
+        f"- **Phase:** {data.get('phase') or 'NONE'}",
+        f"- **Branch:** {data.get('branch') or 'UNKNOWN'}",
+        f"- **HEAD:** {head()}",
+        f"- **Started:** {data.get('started_at') or 'NONE'}",
+        f"- **Updated:** {data.get('updated_at') or 'NONE'}",
+        f"- **Completed:** {data.get('completed_at') or 'NONE'}",
+        f"- **Report generated:** {now()}",
+        "",
+        "## Working tree",
+        "",
+    ]
+
+    tree = working_tree()
+
+    if tree == "clean":
+        lines.append("Working tree is clean.")
+    else:
+        lines.extend([
+            "```text",
+            tree,
+            "```",
+        ])
+
+    lines.extend([
+        "",
+        "## Tests",
+        "",
+        *format_test("targeted", tests.get("targeted")),
+        "",
+        *format_test("full", tests.get("full")),
+        "",
+        "## Human Gate",
+        "",
+    ])
+
+    if gate:
+        lines.extend([
+            "- **Status:** OPEN",
+            f"- **Gate ID:** {gate.get('gate_id', 'UNKNOWN')}",
+            f"- **Type:** {gate.get('type', 'UNKNOWN')}",
+            f"- **Opened:** {gate.get('opened_at', 'UNKNOWN')}",
+            f"- **Question:** {gate.get('question', '')}",
+            f"- **Recommendation:** {gate.get('recommendation', '')}",
+            "",
+            "### Alternatives",
+            "",
+        ])
+
+        alternatives = gate.get("alternatives") or []
+
+        if alternatives:
+            for item in alternatives:
+                lines.append(f"- {item}")
+        else:
+            lines.append("- None recorded.")
+
+        lines.extend([
+            "",
+            "### Risks",
+            "",
+        ])
+
+        risks = gate.get("risks") or []
+
+        if risks:
+            for item in risks:
+                lines.append(f"- {item}")
+        else:
+            lines.append("- None recorded.")
+
+    else:
+        lines.append("- **Status:** NONE OPEN")
+
+    lines.extend([
+        "",
+        "## Last Human Gate Decision",
+        "",
+    ])
+
+    if last_decision:
+        lines.extend([
+            f"- **Gate ID:** {last_decision.get('gate_id', 'UNKNOWN')}",
+            f"- **Decision:** {last_decision.get('decision', 'UNKNOWN')}",
+            f"- **Resolved:** {last_decision.get('resolved_at', 'UNKNOWN')}",
+            f"- **Record:** {last_decision.get('record', '')}",
+        ])
+    else:
+        lines.append("- No recorded decision for the current task.")
+
+    lines.extend([
+        "",
+        "## Runtime integrity",
+        "",
+        "- **Canonical status:** `.claude/runtime/status.json`",
+        "- **Canonical audit:** `.claude/runtime/audit.jsonl`",
+        f"- **Canonical report:** `{REPORT}`",
+        f"- **Human Gate open:** {'YES' if gate else 'NO'}",
+        "",
+        "## Recommended next action",
+        "",
+        recommended_action(data),
+        "",
+    ])
+
+    tmp = REPORT_PATH.with_suffix(".md.tmp")
+    tmp.write_text("\n".join(lines))
+    tmp.replace(REPORT_PATH)
+
+
+def save(data):
+    data["updated_at"] = now()
+
+    STATUS.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = STATUS.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(STATUS)
+
+    render_report(data)
+
+
+def audit(event, **fields):
+    AUDIT.parent.mkdir(parents=True, exist_ok=True)
+
+    record = {
+        "timestamp": now(),
+        "event": event,
+        **fields,
+    }
+
+    with AUDIT.open("a") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
+def next_gate_id():
+    prefix = datetime.now(timezone.utc).strftime("HG-%Y%m%d-")
+    highest = 0
+
+    if AUDIT.exists():
+        for line in AUDIT.read_text().splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            gate_id = record.get("gate_id")
+
+            if not isinstance(gate_id, str):
+                continue
+
+            if not gate_id.startswith(prefix):
+                continue
+
+            try:
+                number = int(gate_id.rsplit("-", 1)[1])
+            except (IndexError, ValueError):
+                continue
+
+            highest = max(highest, number)
+
+    return f"{prefix}{highest + 1:03d}"
+
+
+def test_is_ready(result):
+    if not result:
+        return False
+
+    outcome = result.get("result")
+
+    if outcome not in READY_TEST_RESULTS:
+        return False
+
+    if outcome == "PASS":
+        return bool(
+            str(result.get("command", "")).strip()
+            and str(result.get("summary", "")).strip()
+        )
+
+    if outcome == "NOT_REQUIRED":
+        return (
+            result.get("command") is None
+            and bool(str(result.get("summary", "")).strip())
+        )
+
+    return False
+
+
+def cmd_show(_):
+    print(json.dumps(load(), indent=2))
+
+
+def cmd_report(_):
+    data = load()
+    render_report(data)
+    print(REPORT)
+
+
+def cmd_start(args):
+    data = load()
+
+    if data["state"] not in {
+        "IDLE",
+        "READY_FOR_HUMAN_REVIEW",
+        "FAILED",
+    }:
+        raise SystemExit(
+            f"Cannot start task while state={data['state']}"
+        )
+
+    timestamp = now()
+
+    data.update({
+        "schema_version": "2.0",
+        "project": "CryptoLab-DataHub",
+        "state": "RUNNING",
+        "task_id": args.task_id,
+        "task_title": args.title,
+        "phase": "ANALYZE",
+        "branch": branch(),
+        "started_at": timestamp,
+        "completed_at": None,
+        "tests": {
+            "targeted": None,
+            "full": None,
+        },
+        "human_gate": None,
+        "last_gate_decision": None,
+        "report": REPORT,
+    })
+
+    save(data)
+
+    audit(
+        "TASK_STARTED",
+        task_id=args.task_id,
+        task_title=args.title,
+        branch=data["branch"],
+    )
+
+
+def cmd_phase(args):
+    data = load()
+
+    if data["state"] != "RUNNING":
+        raise SystemExit(
+            f"Cannot change phase while state={data['state']}"
+        )
+
+    previous = data["phase"]
+    data["phase"] = args.phase
+
+    save(data)
+
+    audit(
+        "PHASE_CHANGED",
+        task_id=data["task_id"],
+        previous_phase=previous,
+        phase=args.phase,
+    )
+
+
+def cmd_test(args):
+    data = load()
+
+    if data["state"] != "RUNNING":
+        raise SystemExit(
+            f"Cannot record test while state={data['state']}"
+        )
+
+    command = args.command.strip()
+    summary = args.summary.strip()
+
+    if not command:
+        raise SystemExit(
+            f"{args.result} requires a non-empty test command."
+        )
+
+    if not summary:
+        raise SystemExit(
+            f"{args.result} requires a non-empty summary."
+        )
+
+    test_record = {
+        "command": command,
+        "result": args.result,
+        "summary": summary,
+    }
+
+    data["tests"][args.kind] = test_record
+
+    save(data)
+
+    audit(
+        "TEST_RECORDED",
+        task_id=data["task_id"],
+        kind=args.kind,
+        result=test_record["result"],
+        command=test_record["command"],
+        summary=test_record["summary"],
+    )
+
+
+def cmd_test_not_required(args):
+    data = load()
+
+    if data["state"] != "RUNNING":
+        raise SystemExit(
+            "Cannot record test exemption while "
+            f"state={data['state']}"
+        )
+
+    reason = args.reason.strip()
+
+    if not reason:
+        raise SystemExit(
+            "NOT_REQUIRED requires a non-empty reason."
+        )
+
+    test_record = {
+        "command": None,
+        "result": "NOT_REQUIRED",
+        "summary": reason,
+    }
+
+    data["tests"][args.kind] = test_record
+
+    save(data)
+
+    audit(
+        "TEST_NOT_REQUIRED_RECORDED",
+        task_id=data["task_id"],
+        kind=args.kind,
+        result="NOT_REQUIRED",
+        command=None,
+        summary=reason,
+    )
+
+
+def cmd_gate_open(args):
+    data = load()
+
+    if data["state"] != "RUNNING":
+        raise SystemExit(
+            f"Cannot open gate while state={data['state']}"
+        )
+
+    opened_at = now()
+    gate_id = next_gate_id()
+
+    gate = {
+        "gate_id": gate_id,
+        "type": args.type,
+        "question": args.question,
+        "recommendation": args.recommendation,
+        "alternatives": args.alternative or [],
+        "risks": args.risk or [],
+        "opened_at": opened_at,
+    }
+
+    data["state"] = "BLOCKED_HUMAN_DECISION"
+    data["human_gate"] = gate
+
+    save(data)
+
+    audit(
+        "HUMAN_GATE_OPENED",
+        task_id=data["task_id"],
+        gate_id=gate_id,
+        gate_type=gate["type"],
+        question=gate["question"],
+        recommendation=gate["recommendation"],
+        gate=gate,
+    )
+
+
+def require_open_gate(data):
+    if data["state"] != "BLOCKED_HUMAN_DECISION":
+        raise SystemExit(
+            "Human gate decision requires "
+            "state=BLOCKED_HUMAN_DECISION"
+        )
+
+    if not data.get("human_gate"):
+        raise SystemExit(
+            "Human gate decision requires an active human_gate"
+        )
+
+
+def resolve_gate(data, decision, record, event):
+    gate = data["human_gate"]
+    resolved_at = now()
+
+    data["state"] = "RUNNING"
+    data["human_gate"] = None
+    data["last_gate_decision"] = {
+        "gate_id": gate["gate_id"],
+        "decision": decision,
+        "resolved_at": resolved_at,
+        "record": record,
+    }
+
+    save(data)
+
+    audit(
+        event,
+        task_id=data["task_id"],
+        gate_id=gate["gate_id"],
+        gate_type=gate["type"],
+        decision=decision,
+        decision_record=record,
+        opened_at=gate["opened_at"],
+        resolved_at=resolved_at,
+        gate=gate,
+    )
+
+
+def cmd_gate_approve(args):
+    data = load()
+    require_open_gate(data)
+
+    resolve_gate(
+        data=data,
+        decision="APPROVED",
+        record=args.decision,
+        event="HUMAN_GATE_APPROVED",
+    )
+
+
+def cmd_gate_alternative(args):
+    data = load()
+    require_open_gate(data)
+
+    resolve_gate(
+        data=data,
+        decision="ALTERNATIVE",
+        record=args.decision,
+        event="HUMAN_GATE_ALTERNATIVE_CHOSEN",
+    )
+
+
+def cmd_gate_reject(args):
+    data = load()
+    require_open_gate(data)
+
+    resolve_gate(
+        data=data,
+        decision="REJECTED",
+        record=args.reason,
+        event="HUMAN_GATE_REJECTED",
+    )
+
+
+def cmd_ready(_):
+    data = load()
+
+    if data["state"] != "RUNNING":
+        raise SystemExit(
+            f"Cannot mark ready while state={data['state']}"
+        )
+
+    if data.get("human_gate") is not None:
+        raise SystemExit(
+            "Cannot mark ready while a Human Gate is open."
+        )
+
+    targeted = data["tests"].get("targeted")
+    full = data["tests"].get("full")
+
+    if not test_is_ready(targeted):
+        raise SystemExit(
+            "Targeted test requirement is not satisfied. "
+            "Expected PASS or justified NOT_REQUIRED."
+        )
+
+    if not test_is_ready(full):
+        raise SystemExit(
+            "Full test suite requirement is not satisfied. "
+            "Expected PASS or justified NOT_REQUIRED."
+        )
+
+    data["state"] = "READY_FOR_HUMAN_REVIEW"
+    data["phase"] = "FINAL_VERIFY"
+    data["human_gate"] = None
+    data["completed_at"] = now()
+
+    save(data)
+
+    audit(
+        "TASK_READY_FOR_HUMAN_REVIEW",
+        task_id=data["task_id"],
+        targeted_result=targeted["result"],
+        full_result=full["result"],
+    )
+
+
+def cmd_fail(args):
+    data = load()
+
+    if data["state"] == "BLOCKED_HUMAN_DECISION":
+        raise SystemExit(
+            "Cannot fail task while "
+            "state=BLOCKED_HUMAN_DECISION. "
+            "The active Human Gate must be resolved by a human."
+        )
+
+    if data["state"] != "RUNNING":
+        raise SystemExit(
+            f"Cannot fail task while state={data['state']}"
+        )
+
+    data["state"] = "FAILED"
+    data["completed_at"] = now()
+    data["human_gate"] = None
+
+    save(data)
+
+    audit(
+        "TASK_FAILED",
+        task_id=data["task_id"],
+        summary=args.summary,
+        previous_gate=None,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="CryptoLab Claude runtime state controller"
+    )
+
+    sub = parser.add_subparsers(
+        dest="cmd",
+        required=True,
+    )
+
+    p = sub.add_parser("show")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("report")
+    p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("start")
+    p.add_argument("task_id")
+    p.add_argument("title")
+    p.set_defaults(func=cmd_start)
+
+    p = sub.add_parser("phase")
+    p.add_argument(
+        "phase",
+        choices=sorted(VALID_PHASES),
+    )
+    p.set_defaults(func=cmd_phase)
+
+    p = sub.add_parser("test")
+    p.add_argument(
+        "kind",
+        choices=["targeted", "full"],
+    )
+    p.add_argument(
+        "result",
+        choices=["PASS", "FAIL"],
+    )
+    p.add_argument("command")
+    p.add_argument("summary")
+    p.set_defaults(func=cmd_test)
+
+    p = sub.add_parser("test-not-required")
+    p.add_argument(
+        "kind",
+        choices=["targeted", "full"],
+    )
+    p.add_argument("reason")
+    p.set_defaults(func=cmd_test_not_required)
+
+    gate = sub.add_parser("gate")
+    gate_sub = gate.add_subparsers(
+        dest="gate_cmd",
+        required=True,
+    )
+
+    p = gate_sub.add_parser("open")
+    p.add_argument(
+        "type",
+        choices=sorted(VALID_GATE_TYPES),
+    )
+    p.add_argument("question")
+    p.add_argument("recommendation")
+    p.add_argument(
+        "--alternative",
+        action="append",
+    )
+    p.add_argument(
+        "--risk",
+        action="append",
+    )
+    p.set_defaults(func=cmd_gate_open)
+
+    p = gate_sub.add_parser("approve")
+    p.add_argument("decision")
+    p.set_defaults(func=cmd_gate_approve)
+
+    p = gate_sub.add_parser("alternative")
+    p.add_argument("decision")
+    p.set_defaults(func=cmd_gate_alternative)
+
+    p = gate_sub.add_parser("reject")
+    p.add_argument("reason")
+    p.set_defaults(func=cmd_gate_reject)
+
+    p = sub.add_parser("ready")
+    p.set_defaults(func=cmd_ready)
+
+    p = sub.add_parser("fail")
+    p.add_argument(
+        "summary",
+        nargs="?",
+        default="",
+    )
+    p.set_defaults(func=cmd_fail)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
