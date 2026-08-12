@@ -1,14 +1,8 @@
-<<<<<<< Updated upstream
 pandas>=2.2.0
 requests>=2.32.0
 numpy>=2.0.0
 python-dateutil>=2.9.0
-=======
-pandas
 pyarrow
 PyYAML
-requests
 pytest
-numpy
->>>>>>> Stashed changes
-websocket-client
+websocket-client>=1.9.0
