@@ -33,6 +33,8 @@ ANALYZE
 → ADVERSARIAL_REVIEW
 → CORRECT_FINDINGS
 → RETEST
+→ EXTERNAL_REVIEW
+→ CORRECT_EXTERNAL_FINDINGS
 → FINAL_VERIFY
 → READY_FOR_HUMAN_REVIEW
 
@@ -63,6 +65,78 @@ when the next action is inside the approved autonomous zone.
 
 When an approved task begins, record the task through `statusctl`
 before substantive implementation work begins.
+
+---
+
+## 2A. Work Tasks and Integration Tasks (Semantics A)
+
+Runtime schema 3.0 makes the task model explicit. Every task-bearing
+runtime state carries:
+
+    task_kind        WORK | INTEGRATION
+    parent_task_id   the parent Work Task ID, for INTEGRATION only
+
+### Work Task
+
+A Work Task performs the actual change: analysis, implementation,
+testing, review and correction.
+
+    task_kind      = WORK
+    parent_task_id = null
+
+Its lifecycle is the full sequence:
+
+    ANALYZE
+    IMPLEMENT
+    TARGETED_TEST
+    FULL_TEST
+    ADVERSARIAL_REVIEW
+    CORRECT_FINDINGS
+    RETEST
+    EXTERNAL_REVIEW
+    CORRECT_EXTERNAL_FINDINGS
+    FINAL_VERIFY
+    READY_FOR_HUMAN_REVIEW
+
+A Work Task ends at READY_FOR_HUMAN_REVIEW. Technical completion is
+not integration.
+
+### Integration Task
+
+An Integration Task integrates work that has already been reviewed. It
+starts only from a Work Task in READY_FOR_HUMAN_REVIEW:
+
+    ./.claude/bin/statusctl start-integration TASK_ID TITLE
+
+    task_kind      = INTEGRATION
+    parent_task_id = the completed Work Task's task_id
+    state          = RUNNING
+    phase          = ANALYZE
+
+`parent_task_id` is what ties an integration action back to the
+reviewed work it integrates, so it must differ from the Integration
+Task's own `task_id`. A task cannot be its own parent: the two
+identities are what make the work and its integration separately
+auditable.
+
+Its lifecycle is deliberately narrow:
+
+    ANALYZE
+    FINAL_VERIFY
+
+An Integration Task never implements and never re-tests product code.
+Work-only phases such as IMPLEMENT are rejected by the controller.
+
+If integration reveals that the work itself is wrong, the correct
+response is a new Work Task, not an Integration Task that quietly
+starts implementing.
+
+### Why the split
+
+An integration boundary is a different kind of decision from a code
+change, and it needs its own identity in the runtime record. Semantics
+A keeps the reviewed work and the act of integrating it as two
+separate, individually auditable tasks.
 
 ---
 
@@ -151,6 +225,8 @@ Claude MAY autonomously invoke:
 
     ./.claude/bin/statusctl start TASK_ID TITLE
 
+    ./.claude/bin/statusctl start-integration TASK_ID TITLE
+
     ./.claude/bin/statusctl phase PHASE
 
     ./.claude/bin/statusctl test targeted PASS COMMAND SUMMARY
@@ -175,6 +251,26 @@ These commands are part of the autonomous execution zone when they
 accurately record work already authorized by the task.
 
 `test-not-required` must never be used merely to avoid running a test.
+
+`start` creates a WORK task. `start-integration` creates an
+INTEGRATION task and is legal only from a WORK task in
+READY_FOR_HUMAN_REVIEW.
+
+`migrate-v3` is NOT autonomous:
+
+    ./.claude/bin/statusctl migrate-v3 WORK
+
+    ./.claude/bin/statusctl migrate-v3 INTEGRATION PARENT_TASK_ID
+
+Migration rewrites the operator's canonical runtime state, so it is an
+OPERATOR-INITIATED step. It is configured as `ask` in
+`.claude/settings.json` and requires explicit human approval at the
+moment of use.
+
+Claude must not migrate the canonical runtime on its own initiative.
+When a schema-2.0 runtime blocks progress, Claude must stop and report
+that migration is required, quoting the exact command, rather than
+requesting approval to run it as part of ordinary work.
 
 ---
 
@@ -520,7 +616,7 @@ contract is wrong.
 
 Runtime phase must follow actual work.
 
-Typical transitions:
+Typical Work Task transitions:
 
     start
       ↓
@@ -538,9 +634,35 @@ Typical transitions:
       ↓
     RETEST
       ↓
+    EXTERNAL_REVIEW
+      ↓
+    CORRECT_EXTERNAL_FINDINGS
+      ↓
     FINAL_VERIFY
       ↓
     ready
+
+Typical Integration Task transitions:
+
+    start-integration
+      ↓
+    ANALYZE
+      ↓
+    gate open GIT_INTEGRATION ...
+      ↓
+    FINAL_VERIFY
+      ↓
+    ready
+
+The controller enforces the phase set for the current `task_kind`. A
+Work-only phase requested on an Integration Task is rejected without
+mutating runtime state.
+
+`ready` requires that the phase is ALREADY `FINAL_VERIFY`. The
+controller does not advance the phase on your behalf, because doing so
+would let the completion command manufacture the very evidence it is
+supposed to check. Record `FINAL_VERIFY` only once final verification
+has actually been performed.
 
 Do not advance a phase merely to make status appear complete.
 
@@ -604,6 +726,16 @@ Claude must stop before:
 and other integration or destructive Git actions defined by policy.
 
 Technical completion does not authorize integration.
+
+`GIT_INTEGRATION` Human Gates are INTEGRATION-TASK-ONLY.
+
+A Work Task attempting:
+
+    ./.claude/bin/statusctl gate open GIT_INTEGRATION ...
+
+is rejected by the controller without mutating runtime state. Start an
+Integration Task first, so the integration decision is recorded against
+a task whose identity says it is an integration.
 
 Each materially distinct integration boundary should have an explicit
 Human Gate whose decision scope states the authorized action.
@@ -871,7 +1003,7 @@ authority.
 
 ## 24A. Runtime structural and invariant validation
 
-`statusctl` enforces the runtime v2 contract internally using only the
+`statusctl` enforces the runtime v3 contract internally using only the
 Python standard library.
 
 This enforcement complements the declarative JSON Schema at:
@@ -920,7 +1052,18 @@ Required enforcement includes:
 - states other than BLOCKED_HUMAN_DECISION have no active Human Gate;
 - READY_FOR_HUMAN_REVIEW requires FINAL_VERIFY, a completion timestamp,
   and targeted/full results satisfying PASS or justified NOT_REQUIRED;
-- FAILED requires a completion timestamp.
+- FAILED requires a completion timestamp;
+- IDLE requires `task_kind=null` and `parent_task_id=null`;
+- every task-bearing state requires a non-null `task_kind`;
+- WORK requires `parent_task_id=null`;
+- INTEGRATION requires a non-empty `parent_task_id`;
+- INTEGRATION requires `parent_task_id` to differ from `task_id`;
+- the phase must belong to the phase set of the current `task_kind`.
+
+The `task_id != parent_task_id` rule is enforced only by the internal
+validator. JSON Schema draft 2020-12 cannot compare one property's
+value against a sibling property's value, and no non-standard schema
+extension is used to imitate that capability.
 
 If validation rejects a candidate transition:
 
@@ -933,10 +1076,45 @@ If validation rejects a candidate transition:
 A validation failure is not authorization to manually repair or bypass
 runtime state.
 
-Schema version remains `2.0` unless a genuine runtime data-format
-migration is separately approved. Stricter enforcement of already
-intended v2 invariants does not by itself require a schema-version
-change.
+Schema version is `3.0`. It changes only when a genuine runtime
+data-format migration is separately approved. Stricter enforcement of
+already intended invariants does not by itself require a
+schema-version change.
+
+### Schema migration
+
+The canonical load path accepts schema `3.0` only.
+
+A schema-2.0 `status.json` is refused with instructions to migrate. It
+is never silently normalized or auto-upgraded, because an implicit
+upgrade would rewrite the operator's runtime state as a side effect of
+an unrelated command.
+
+Migration is a separate, explicit command:
+
+    ./.claude/bin/statusctl migrate-v3 WORK
+
+    ./.claude/bin/statusctl migrate-v3 INTEGRATION PARENT_TASK_ID
+
+The migration path is fail-closed at every step:
+
+    raw legacy read, never the normal load path
+      ↓
+    validate the legacy v2 shape and invariants
+      ↓
+    deterministic transform preserving all legacy runtime fields
+      ↓
+    validate the resulting v3 state
+      ↓
+    atomic replacement of canonical status.json
+      ↓
+    RUNTIME_SCHEMA_MIGRATED audit event
+
+A rejected migration leaves `status.json` unchanged and appends no
+success audit event.
+
+Migrating to an INTEGRATION task requires the parent Work Task ID and
+requires that the legacy phase is legal for an Integration Task.
 
 ---
 

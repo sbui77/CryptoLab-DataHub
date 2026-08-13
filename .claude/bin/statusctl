@@ -32,7 +32,21 @@ LOCK_PATH = (
     / f"cryptolab-statusctl-{LOCK_KEY}.lock"
 )
 
-VALID_PHASES = {
+SCHEMA_VERSION = "3.0"
+
+LEGACY_SCHEMA_VERSION = "2.0"
+
+TASK_KIND_WORK = "WORK"
+
+TASK_KIND_INTEGRATION = "INTEGRATION"
+
+VALID_TASK_KINDS = {
+    TASK_KIND_WORK,
+    TASK_KIND_INTEGRATION,
+}
+
+# Full Work Task lifecycle.
+WORK_PHASES = {
     "ANALYZE",
     "IMPLEMENT",
     "TARGETED_TEST",
@@ -40,7 +54,36 @@ VALID_PHASES = {
     "ADVERSARIAL_REVIEW",
     "CORRECT_FINDINGS",
     "RETEST",
+    "EXTERNAL_REVIEW",
+    "CORRECT_EXTERNAL_FINDINGS",
     "FINAL_VERIFY",
+}
+
+# An Integration Task integrates an already reviewed Work Task. It
+# never implements and never re-tests product code, so its lifecycle
+# is deliberately narrow.
+INTEGRATION_PHASES = {
+    "ANALYZE",
+    "FINAL_VERIFY",
+}
+
+PHASES_BY_TASK_KIND = {
+    TASK_KIND_WORK: WORK_PHASES,
+    TASK_KIND_INTEGRATION: INTEGRATION_PHASES,
+}
+
+VALID_PHASES = WORK_PHASES | INTEGRATION_PHASES
+
+# Schema 2.0 predates the external-review phases.
+LEGACY_PHASES = WORK_PHASES - {
+    "EXTERNAL_REVIEW",
+    "CORRECT_EXTERNAL_FINDINGS",
+}
+
+# An integration boundary belongs to an Integration Task, so these
+# gate types are refused for a Work Task.
+INTEGRATION_ONLY_GATE_TYPES = {
+    "GIT_INTEGRATION",
 }
 
 VALID_GATE_TYPES = {
@@ -77,9 +120,26 @@ VALID_GATE_DECISIONS = {
 
 TOP_LEVEL_KEYS = {
     "schema_version", "project", "state", "task_id", "task_title",
+    "task_kind", "parent_task_id",
     "phase", "branch", "started_at", "updated_at", "completed_at",
     "tests", "human_gate", "last_gate_decision", "report",
 }
+
+# Schema 2.0 carried no task model.
+LEGACY_TOP_LEVEL_KEYS = TOP_LEVEL_KEYS - {
+    "task_kind",
+    "parent_task_id",
+}
+
+MIGRATION_HINT = (
+    "Runtime status uses schema "
+    f"{LEGACY_SCHEMA_VERSION}, but this controller requires "
+    f"schema {SCHEMA_VERSION}. Run an explicit migration first:\n"
+    "    ./.claude/bin/statusctl migrate-v3 WORK\n"
+    "    ./.claude/bin/statusctl migrate-v3 INTEGRATION "
+    "PARENT_TASK_ID\n"
+    "Normal commands never upgrade runtime state implicitly."
+)
 
 GATE_ID_RE = re.compile(r"^HG-[0-9]{8}-[0-9]{3,}$")
 
@@ -261,18 +321,115 @@ def validate_gate_decision(decision):
     require_non_empty_string(decision["record"], "last_gate_decision.record")
 
 
-def validate_runtime_state(data):
-    require_exact_keys(data, TOP_LEVEL_KEYS, "runtime status")
+def same_task_identity(left, right):
+    """
+    Return True when two task IDs denote the same task.
 
-    if data["schema_version"] != "2.0":
-        validation_error('schema_version must be "2.0".')
+    Comparison ignores surrounding whitespace, so a padded copy of an
+    ID cannot present itself as a different task.
+    """
+
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+
+    return left.strip() == right.strip()
+
+
+def validate_task_model(data):
+    """
+    Enforce the schema-3.0 task model.
+
+    IDLE
+        task_kind=null, parent_task_id=null
+
+    WORK
+        task_kind="WORK", parent_task_id=null
+
+    INTEGRATION
+        task_kind="INTEGRATION", parent_task_id=<Work Task ID>
+
+    The phase model is a function of task_kind: an Integration Task
+    integrates work that is already reviewed, so Work-only phases such
+    as IMPLEMENT are not legal for it.
+    """
+
+    task_kind = data["task_kind"]
+
+    if task_kind is not None and task_kind not in VALID_TASK_KINDS:
+        validation_error(f"task_kind is invalid: {task_kind}")
+
+    require_nullable_string(data["parent_task_id"], "parent_task_id")
+
+    if data["state"] == "IDLE":
+        if task_kind is not None:
+            validation_error("IDLE requires task_kind=null.")
+        if data["parent_task_id"] is not None:
+            validation_error("IDLE requires parent_task_id=null.")
+        return
+
+    if task_kind is None:
+        validation_error(
+            f"{data['state']} requires a non-null task_kind."
+        )
+
+    if task_kind == TASK_KIND_WORK:
+        if data["parent_task_id"] is not None:
+            validation_error(
+                "WORK requires parent_task_id=null."
+            )
+    else:
+        require_non_empty_string(
+            data["parent_task_id"], "parent_task_id"
+        )
+
+        if same_task_identity(
+            data["task_id"],
+            data["parent_task_id"],
+        ):
+            validation_error(
+                "INTEGRATION requires parent_task_id to differ "
+                "from task_id: a task cannot be its own parent."
+            )
+
+    phase = data["phase"]
+    allowed = PHASES_BY_TASK_KIND[task_kind]
+
+    if phase is not None and phase not in allowed:
+        validation_error(
+            f"phase {phase} is not legal for a "
+            f"{task_kind} task."
+        )
+
+
+def validate_state_shape(
+    data,
+    *,
+    schema_version,
+    top_level_keys,
+    phases,
+    task_model,
+):
+    """
+    Shared structural and cross-field validation.
+
+    The schema-3.0 contract and the legacy schema-2.0 contract share
+    every field except the task model, so they share one
+    implementation rather than drifting apart.
+    """
+
+    require_exact_keys(data, top_level_keys, "runtime status")
+
+    if data["schema_version"] != schema_version:
+        validation_error(
+            f'schema_version must be "{schema_version}".'
+        )
     if data["project"] != "CryptoLab-DataHub":
         validation_error('project must be "CryptoLab-DataHub".')
     if data["report"] != REPORT:
         validation_error(f"report must be {REPORT!r}.")
     if data["state"] not in VALID_STATES:
         validation_error(f"state is invalid: {data['state']}")
-    if data["phase"] is not None and data["phase"] not in VALID_PHASES:
+    if data["phase"] is not None and data["phase"] not in phases:
         validation_error(f"phase is invalid: {data['phase']}")
 
     require_nullable_string(data["task_id"], "task_id")
@@ -287,6 +444,9 @@ def validate_runtime_state(data):
     validate_test_result(data["tests"]["full"], "tests.full")
     validate_human_gate(data["human_gate"])
     validate_gate_decision(data["last_gate_decision"])
+
+    if task_model:
+        validate_task_model(data)
 
     state = data["state"]
     if state == "IDLE":
@@ -343,6 +503,42 @@ def validate_runtime_state(data):
         require_timestamp(data["completed_at"], "completed_at")
 
 
+def validate_runtime_state(data):
+    """
+    Canonical schema-3.0 validator.
+
+    This validator accepts schema 3.0 only. Legacy schema-2.0 state is
+    not silently normalized here: it must pass through the explicit
+    migrate-v3 path.
+    """
+
+    validate_state_shape(
+        data,
+        schema_version=SCHEMA_VERSION,
+        top_level_keys=TOP_LEVEL_KEYS,
+        phases=VALID_PHASES,
+        task_model=True,
+    )
+
+
+def validate_legacy_runtime_state(data):
+    """
+    Validate a schema-2.0 state before it may be migrated.
+
+    Migration transforms runtime state, so the input must be a valid
+    v2 state rather than merely a JSON object that happens to carry a
+    schema_version field.
+    """
+
+    validate_state_shape(
+        data,
+        schema_version=LEGACY_SCHEMA_VERSION,
+        top_level_keys=LEGACY_TOP_LEVEL_KEYS,
+        phases=LEGACY_PHASES,
+        task_model=False,
+    )
+
+
 def git_output(args):
     try:
         return subprocess.check_output(
@@ -372,11 +568,13 @@ def working_tree():
 
 def idle_state():
     data = {
-        "schema_version": "2.0",
+        "schema_version": SCHEMA_VERSION,
         "project": "CryptoLab-DataHub",
         "state": "IDLE",
         "task_id": None,
         "task_title": None,
+        "task_kind": None,
+        "parent_task_id": None,
         "phase": None,
         "branch": None,
         "started_at": None,
@@ -395,9 +593,13 @@ def idle_state():
     return data
 
 
-def load():
-    if not STATUS.exists():
-        return idle_state()
+def read_status_document():
+    """
+    Read and parse canonical status.json without interpreting it.
+
+    Both the normal load path and the migration path need the raw
+    document, but they validate it against different contracts.
+    """
 
     try:
         data = json.loads(STATUS.read_text())
@@ -406,7 +608,71 @@ def load():
             f"Invalid status JSON: {STATUS}: {exc}"
         ) from exc
 
+    if not isinstance(data, dict):
+        raise SystemExit(
+            f"Invalid status JSON: {STATUS}: expected an object."
+        )
+
+    return data
+
+
+def load():
+    """
+    Canonical fail-closed load path.
+
+    Schema 3.0 only. A schema-2.0 runtime is refused with explicit
+    migration instructions rather than being silently upgraded,
+    because an implicit upgrade would rewrite the operator's runtime
+    state as a side effect of an unrelated command.
+    """
+
+    if not STATUS.exists():
+        return idle_state()
+
+    data = read_status_document()
+
+    if data.get("schema_version") == LEGACY_SCHEMA_VERSION:
+        raise SystemExit(MIGRATION_HINT)
+
     validate_runtime_state(data)
+    return data
+
+
+def load_legacy_state():
+    """
+    Dedicated raw legacy-read path used only by migrate-v3.
+
+    This never calls load(): the normal load path refuses schema 2.0
+    by design, so migration must read and validate the legacy
+    document itself.
+    """
+
+    if not STATUS.exists():
+        raise SystemExit(
+            "No runtime status to migrate: "
+            f"{STATUS} does not exist. A fresh runtime is already "
+            f"schema {SCHEMA_VERSION}."
+        )
+
+    data = read_status_document()
+
+    version = data.get("schema_version")
+
+    if version == SCHEMA_VERSION:
+        raise SystemExit(
+            "Runtime status is already schema "
+            f"{SCHEMA_VERSION}; nothing to migrate."
+        )
+
+    if version != LEGACY_SCHEMA_VERSION:
+        raise SystemExit(
+            "Cannot migrate unsupported schema_version: "
+            f"{version!r}. Only schema {LEGACY_SCHEMA_VERSION} can "
+            f"be migrated to schema {SCHEMA_VERSION}."
+        )
+
+    validate_legacy_runtime_state(data)
+
     return data
 
 
@@ -485,6 +751,9 @@ def render_report(data):
         "",
         f"- **Task ID:** {data.get('task_id') or 'NONE'}",
         f"- **Title:** {data.get('task_title') or 'NONE'}",
+        f"- **Task kind:** {data.get('task_kind') or 'NONE'}",
+        f"- **Parent Work Task:** "
+        f"{data.get('parent_task_id') or 'NONE'}",
         f"- **State:** {data.get('state') or 'UNKNOWN'}",
         f"- **Phase:** {data.get('phase') or 'NONE'}",
         f"- **Branch:** {data.get('branch') or 'UNKNOWN'}",
@@ -742,6 +1011,155 @@ def test_is_ready(result):
     return False
 
 
+def migrate_state_to_v3(
+    legacy,
+    task_kind,
+    parent_task_id,
+):
+    """
+    Transform a validated schema-2.0 state into schema 3.0.
+
+    The transformation is deterministic and preserves every legacy
+    runtime field. Only the schema version and the new task-model
+    fields are introduced.
+
+    Callers must reject an IDLE legacy state before reaching here: an
+    IDLE runtime carries no task to assign a kind to.
+    """
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "project": legacy["project"],
+        "state": legacy["state"],
+        "task_id": legacy["task_id"],
+        "task_title": legacy["task_title"],
+        "task_kind": task_kind,
+        "parent_task_id": (
+            None
+            if task_kind == TASK_KIND_WORK
+            else parent_task_id
+        ),
+        "phase": legacy["phase"],
+        "branch": legacy["branch"],
+        "started_at": legacy["started_at"],
+        "updated_at": legacy["updated_at"],
+        "completed_at": legacy["completed_at"],
+        "tests": legacy["tests"],
+        "human_gate": legacy["human_gate"],
+        "last_gate_decision": legacy["last_gate_decision"],
+        "report": legacy["report"],
+    }
+
+
+def cmd_migrate_v3(args):
+    """
+    Explicit, operator-driven schema-2.0 to schema-3.0 migration.
+
+    Order matters and is fail-closed throughout:
+
+        raw legacy read (never load())
+          ↓
+        validate legacy v2 shape and invariants
+          ↓
+        deterministic transform
+          ↓
+        validate resulting v3 state
+          ↓
+        atomic replacement of canonical status.json
+          ↓
+        RUNTIME_SCHEMA_MIGRATED audit event
+
+    A rejected migration leaves status.json byte-identical and
+    appends no success event.
+    """
+
+    task_kind = args.task_kind
+    parent_task_id = args.parent_task_id
+
+    if task_kind == TASK_KIND_INTEGRATION:
+        if parent_task_id is None or not parent_task_id.strip():
+            raise SystemExit(
+                "Migrating to an Integration Task requires the "
+                "parent Work Task ID:\n"
+                "    ./.claude/bin/statusctl migrate-v3 "
+                "INTEGRATION PARENT_TASK_ID"
+            )
+
+        parent_task_id = parent_task_id.strip()
+
+    elif parent_task_id is not None:
+        raise SystemExit(
+            "A Work Task has no parent task; "
+            "parent_task_id is only valid for INTEGRATION."
+        )
+
+    legacy = load_legacy_state()
+
+    # An IDLE runtime has no task, so there is nothing to assign a
+    # task kind to. It is also unwritable by construction: save()
+    # stamps updated_at, which IDLE requires to be null. Refusing here
+    # keeps the reason visible instead of surfacing a validation error
+    # that appears to blame the operator's file.
+    if legacy["state"] == "IDLE":
+        raise SystemExit(
+            "Runtime status is IDLE, so there is no task to "
+            f"migrate. A fresh runtime is already schema "
+            f"{SCHEMA_VERSION}: remove the legacy status file, or "
+            "start a task instead of migrating."
+        )
+
+    if (
+        task_kind == TASK_KIND_INTEGRATION
+        and same_task_identity(
+            legacy["task_id"],
+            parent_task_id,
+        )
+    ):
+        raise SystemExit(
+            "Cannot migrate to an Integration Task whose parent is "
+            f"itself: parent_task_id {parent_task_id} equals the "
+            "task's own task_id. Supply the ID of the Work Task "
+            "being integrated."
+        )
+
+    if (
+        task_kind == TASK_KIND_INTEGRATION
+        and legacy["phase"] not in INTEGRATION_PHASES
+    ):
+        raise SystemExit(
+            "Cannot migrate to an Integration Task: current phase "
+            f"{legacy['phase']} is not legal for an Integration "
+            "Task. Legal Integration Task phases are "
+            f"{', '.join(sorted(INTEGRATION_PHASES))}."
+        )
+
+    migrated = migrate_state_to_v3(
+        legacy,
+        task_kind,
+        parent_task_id,
+    )
+
+    # save() validates the candidate before atomically replacing
+    # canonical status.json, so an invalid transform cannot reach disk.
+    save(migrated)
+
+    audit(
+        "RUNTIME_SCHEMA_MIGRATED",
+        task_id=migrated["task_id"],
+        from_schema=LEGACY_SCHEMA_VERSION,
+        to_schema=SCHEMA_VERSION,
+        task_kind=migrated["task_kind"],
+        parent_task_id=migrated["parent_task_id"],
+        state=migrated["state"],
+        phase=migrated["phase"],
+    )
+
+    print(
+        f"Migrated runtime status to schema {SCHEMA_VERSION} "
+        f"(task_kind={migrated['task_kind']})."
+    )
+
+
 def cmd_show(_):
     print(
         json.dumps(
@@ -772,11 +1190,13 @@ def cmd_start(args):
     timestamp = now()
 
     data.update({
-        "schema_version": "2.0",
+        "schema_version": SCHEMA_VERSION,
         "project": "CryptoLab-DataHub",
         "state": "RUNNING",
         "task_id": args.task_id,
         "task_title": args.title,
+        "task_kind": TASK_KIND_WORK,
+        "parent_task_id": None,
         "phase": "ANALYZE",
         "branch": branch(),
         "started_at": timestamp,
@@ -796,6 +1216,90 @@ def cmd_start(args):
         "TASK_STARTED",
         task_id=args.task_id,
         task_title=args.title,
+        task_kind=TASK_KIND_WORK,
+        parent_task_id=None,
+        branch=data["branch"],
+    )
+
+
+def cmd_start_integration(args):
+    """
+    Start an Integration Task for a completed Work Task.
+
+    Integration is only meaningful for work that has already reached
+    human review, so the current task must be a Work Task in
+    READY_FOR_HUMAN_REVIEW. Its task_id becomes the new Integration
+    Task's parent, which is what ties an integration action back to
+    the reviewed work it integrates.
+    """
+
+    data = load()
+
+    if data["state"] != "READY_FOR_HUMAN_REVIEW":
+        raise SystemExit(
+            "Cannot start an Integration Task while "
+            f"state={data['state']}. An Integration Task may only "
+            "follow a Work Task in READY_FOR_HUMAN_REVIEW."
+        )
+
+    if data["task_kind"] != TASK_KIND_WORK:
+        raise SystemExit(
+            "Cannot start an Integration Task from "
+            f"task_kind={data['task_kind']}. The parent must be a "
+            "WORK task."
+        )
+
+    parent_task_id = data["task_id"]
+
+    require_non_empty_string(
+        parent_task_id,
+        "parent_task_id",
+    )
+
+    # Semantics A keeps the reviewed work and the act of integrating
+    # it as two separate, individually auditable identities. Reusing
+    # the parent's ID would collapse them into one.
+    if same_task_identity(
+        args.task_id,
+        parent_task_id,
+    ):
+        raise SystemExit(
+            "Cannot start an Integration Task with the same task_id "
+            f"as its parent Work Task ({parent_task_id}). Give the "
+            "Integration Task its own identity."
+        )
+
+    timestamp = now()
+
+    data.update({
+        "schema_version": SCHEMA_VERSION,
+        "project": "CryptoLab-DataHub",
+        "state": "RUNNING",
+        "task_id": args.task_id,
+        "task_title": args.title,
+        "task_kind": TASK_KIND_INTEGRATION,
+        "parent_task_id": parent_task_id,
+        "phase": "ANALYZE",
+        "branch": branch(),
+        "started_at": timestamp,
+        "completed_at": None,
+        "tests": {
+            "targeted": None,
+            "full": None,
+        },
+        "human_gate": None,
+        "last_gate_decision": None,
+        "report": REPORT,
+    })
+
+    save(data)
+
+    audit(
+        "INTEGRATION_TASK_STARTED",
+        task_id=args.task_id,
+        task_title=args.title,
+        task_kind=TASK_KIND_INTEGRATION,
+        parent_task_id=parent_task_id,
         branch=data["branch"],
     )
 
@@ -806,6 +1310,16 @@ def cmd_phase(args):
     if data["state"] != "RUNNING":
         raise SystemExit(
             f"Cannot change phase while state={data['state']}"
+        )
+
+    task_kind = data["task_kind"]
+    allowed = PHASES_BY_TASK_KIND.get(task_kind, set())
+
+    if args.phase not in allowed:
+        raise SystemExit(
+            f"Phase {args.phase} is not legal for a {task_kind} "
+            "task. Legal phases are "
+            f"{', '.join(sorted(allowed))}."
         )
 
     previous = data["phase"]
@@ -905,6 +1419,17 @@ def cmd_gate_open(args):
     if data["state"] != "RUNNING":
         raise SystemExit(
             f"Cannot open gate while state={data['state']}"
+        )
+
+    if (
+        args.type in INTEGRATION_ONLY_GATE_TYPES
+        and data["task_kind"] != TASK_KIND_INTEGRATION
+    ):
+        raise SystemExit(
+            f"Gate type {args.type} is Integration-Task-only, but "
+            f"the current task_kind is {data['task_kind']}. Start "
+            "an Integration Task with start-integration before "
+            "requesting an integration decision."
         )
 
     opened_at = now()
@@ -1063,6 +1588,16 @@ def cmd_ready(_):
             "Cannot mark ready while a Human Gate is open."
         )
 
+    # The phase must already reflect completed verification work.
+    # Setting it here would let `ready` manufacture the very evidence
+    # it is supposed to check.
+    if data["phase"] != "FINAL_VERIFY":
+        raise SystemExit(
+            "Cannot mark ready while phase="
+            f"{data['phase']}. Record FINAL_VERIFY only once final "
+            "verification has actually been performed."
+        )
+
     targeted = data["tests"].get("targeted")
     full = data["tests"].get("full")
 
@@ -1079,7 +1614,6 @@ def cmd_ready(_):
         )
 
     data["state"] = "READY_FOR_HUMAN_REVIEW"
-    data["phase"] = "FINAL_VERIFY"
     data["human_gate"] = None
     data["completed_at"] = now()
 
@@ -1088,6 +1622,8 @@ def cmd_ready(_):
     audit(
         "TASK_READY_FOR_HUMAN_REVIEW",
         task_id=data["task_id"],
+        task_kind=data["task_kind"],
+        parent_task_id=data["parent_task_id"],
         targeted_result=targeted["result"],
         full_result=full["result"],
     )
@@ -1142,6 +1678,23 @@ def main():
     p.add_argument("task_id")
     p.add_argument("title")
     p.set_defaults(func=cmd_start)
+
+    p = sub.add_parser("start-integration")
+    p.add_argument("task_id")
+    p.add_argument("title")
+    p.set_defaults(func=cmd_start_integration)
+
+    p = sub.add_parser("migrate-v3")
+    p.add_argument(
+        "task_kind",
+        choices=sorted(VALID_TASK_KINDS),
+    )
+    p.add_argument(
+        "parent_task_id",
+        nargs="?",
+        default=None,
+    )
+    p.set_defaults(func=cmd_migrate_v3)
 
     p = sub.add_parser("phase")
     p.add_argument(

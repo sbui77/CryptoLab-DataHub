@@ -21,6 +21,7 @@
       "Bash(./.claude/bin/statusctl show)",
       "Bash(./.claude/bin/statusctl report)",
       "Bash(./.claude/bin/statusctl start *)",
+      "Bash(./.claude/bin/statusctl start-integration *)",
       "Bash(./.claude/bin/statusctl phase *)",
       "Bash(./.claude/bin/statusctl test *)",
       "Bash(./.claude/bin/statusctl test-not-required *)",
@@ -30,6 +31,8 @@
     ],
 
     "ask": [
+      "Bash(./.claude/bin/statusctl migrate-v3 *)",
+
       "Bash(git commit *)",
       "Bash(git push *)",
       "Bash(git merge *)",

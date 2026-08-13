@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "cryptolab-claude-status-v2",
+  "$id": "cryptolab-claude-status-v3",
   "title": "CryptoLab Claude Runtime Status",
   "type": "object",
   "additionalProperties": false,
@@ -10,6 +10,8 @@
     "state",
     "task_id",
     "task_title",
+    "task_kind",
+    "parent_task_id",
     "phase",
     "branch",
     "started_at",
@@ -22,7 +24,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "2.0"
+      "const": "3.0"
     },
     "project": {
       "const": "CryptoLab-DataHub"
@@ -48,6 +50,20 @@
         "null"
       ]
     },
+    "task_kind": {
+      "enum": [
+        null,
+        "WORK",
+        "INTEGRATION"
+      ]
+    },
+    "parent_task_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
     "phase": {
       "type": [
         "string",
@@ -62,6 +78,8 @@
         "ADVERSARIAL_REVIEW",
         "CORRECT_FINDINGS",
         "RETEST",
+        "EXTERNAL_REVIEW",
+        "CORRECT_EXTERNAL_FINDINGS",
         "FINAL_VERIFY"
       ]
     },
@@ -132,6 +150,120 @@
       "const": ".claude/runtime/latest_report.md"
     }
   },
+  "allOf": [
+    {
+      "$comment": "IDLE carries no task, so it carries no task model.",
+      "if": {
+        "properties": {
+          "state": {
+            "const": "IDLE"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "task_kind": {
+            "const": null
+          },
+          "parent_task_id": {
+            "const": null
+          }
+        }
+      }
+    },
+    {
+      "$comment": "A task-bearing state requires a task kind.",
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "RUNNING",
+              "BLOCKED_HUMAN_DECISION",
+              "READY_FOR_HUMAN_REVIEW",
+              "FAILED"
+            ]
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "task_kind": {
+            "enum": [
+              "WORK",
+              "INTEGRATION"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "A Work Task has no parent and uses the full Work lifecycle.",
+      "if": {
+        "properties": {
+          "task_kind": {
+            "const": "WORK"
+          }
+        },
+        "required": [
+          "task_kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "parent_task_id": {
+            "const": null
+          },
+          "phase": {
+            "enum": [
+              "ANALYZE",
+              "IMPLEMENT",
+              "TARGETED_TEST",
+              "FULL_TEST",
+              "ADVERSARIAL_REVIEW",
+              "CORRECT_FINDINGS",
+              "RETEST",
+              "EXTERNAL_REVIEW",
+              "CORRECT_EXTERNAL_FINDINGS",
+              "FINAL_VERIFY"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "An Integration Task requires a parent Work Task and uses the narrow Integration lifecycle. The further invariant task_id != parent_task_id cannot be expressed here: JSON Schema draft 2020-12 has no way to compare one property's value against a sibling property's value, and no non-standard extension is used to fake it. That cross-field rule is enforced by the internal validator in .claude/bin/statusctl (validate_task_model).",
+      "if": {
+        "properties": {
+          "task_kind": {
+            "const": "INTEGRATION"
+          }
+        },
+        "required": [
+          "task_kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "parent_task_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "phase": {
+            "enum": [
+              "ANALYZE",
+              "FINAL_VERIFY"
+            ]
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "testResult": {
       "oneOf": [
