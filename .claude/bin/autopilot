@@ -1,0 +1,2229 @@
+#!/usr/bin/env python3
+
+"""
+Hardening 4.2.1 — unattended autopilot.
+
+Autopilot is the deterministic controller; Claude is the worker.
+
+The division of authority is the whole point:
+
+    autopilot decides WHICH phase runs next, from durable runtime
+    state only, and drives the transition through statusctl;
+
+    the worker performs the phase and reports a structured outcome,
+    which is never trusted as evidence of a state change.
+
+Every property that makes unattended operation safe is enforced here
+rather than assumed:
+
+    stdin is closed, so no subprocess can wait on a human;
+    every subprocess is bounded by a timeout;
+    a worker failure blocks instead of advancing the phase;
+    an open Human Gate stops the run before the worker is invoked;
+    gate resolution and runtime migration are refused by the guard;
+    the run refuses to start while another autopilot holds the lock;
+    the worker runs under a named permission mode with an explicit
+      capability allowlist, never a permission bypass;
+    the worker session reaches a read-only controller only, so it can
+      neither move the lifecycle nor record its own evidence;
+    a lifecycle mutation observed across a worker cycle is refused
+      rather than built upon;
+    FINAL_VERIFY re-establishes both verification results itself and
+      fails closed when it cannot;
+    untracked entries the run left behind block completion, which a
+      tracked-content diff check cannot see;
+    shell and interpreter wrappers are refused, so argv-only
+      execution cannot be re-opened through a wrapper.
+
+Autopilot never resolves a Human Gate and never migrates the runtime.
+Those are human authority and operator authority respectively.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import stat
+import subprocess
+import tempfile
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+STATUSCTL = ROOT / ".claude" / "bin" / "statusctl"
+
+CONTRACT = "CLAUDE.md"
+
+
+# ================================================================
+# EXIT CODES
+# ================================================================
+#
+# Dedicated exit codes exist so an unattended supervisor can tell
+# "stopped correctly at a decision boundary" from "could not
+# continue". A generic non-zero exit would collapse that distinction.
+
+EXIT_OK = 0
+EXIT_WAITING_FOR_HUMAN = 10
+EXIT_BLOCKED_PERMISSION = 11
+EXIT_BLOCKED_TECHNICAL = 12
+EXIT_CONCURRENT = 13
+EXIT_WAITING_EXTERNAL = 14
+
+
+RESULT_LINE_PREFIX = "AUTOPILOT_RESULT "
+
+
+# ================================================================
+# TIMING
+# ================================================================
+
+LOCK_TIMEOUT_SECONDS = 5.0
+LOCK_RETRY_SECONDS = 0.05
+
+DEFAULT_WORKER_TIMEOUT_SECONDS = 900.0
+
+# statusctl serializes on its own lock with a 10s timeout, so a
+# controller call that has not returned well after that is wedged.
+STATUSCTL_TIMEOUT_SECONDS = 60.0
+
+DEFAULT_VERIFY_TIMEOUT_SECONDS = 1800.0
+
+DEFAULT_MAX_CYCLES = 12
+
+
+# ================================================================
+# PHASE MODEL
+# ================================================================
+#
+# These mirror statusctl's phase sets. Autopilot proposes the next
+# phase; statusctl remains the authority that accepts or rejects it.
+
+WORK_SEQUENCE = [
+    "ANALYZE",
+    "IMPLEMENT",
+    "TARGETED_TEST",
+    "FULL_TEST",
+    "ADVERSARIAL_REVIEW",
+    "CORRECT_FINDINGS",
+    "RETEST",
+    "EXTERNAL_REVIEW",
+    "CORRECT_EXTERNAL_FINDINGS",
+    "FINAL_VERIFY",
+]
+
+INTEGRATION_SEQUENCE = [
+    "ANALYZE",
+    "FINAL_VERIFY",
+]
+
+SEQUENCE_BY_TASK_KIND = {
+    "WORK": WORK_SEQUENCE,
+    "INTEGRATION": INTEGRATION_SEQUENCE,
+}
+
+# External review is performed by an independent reviewer, not by the
+# worker. Autopilot halts here rather than driving through a phase
+# whose evidence it cannot produce. An operator advances the phase
+# once the external review has actually happened.
+EXTERNAL_WAIT_PHASES = {
+    "EXTERNAL_REVIEW",
+}
+
+# Phases where autopilot runs verification itself, when the operator
+# has configured a verification command.
+VERIFY_PHASES = {
+    "TARGETED_TEST": "targeted",
+    "FULL_TEST": "full",
+    "RETEST": "full",
+}
+
+VALID_GATE_TYPES = {
+    "GIT_INTEGRATION",
+    "DEPENDENCY_CHANGE",
+    "DATA_MUTATION",
+    "SECURITY_AUTH",
+    "OS_CHANGE",
+    "SEMANTIC_DECISION",
+    "ARCHITECTURE_DECISION",
+    "SCOPE_EXPANSION",
+    "UNRESOLVED_DISCUSS",
+    "OTHER",
+}
+
+# Both verifications are re-established at FINAL_VERIFY, in this
+# order, from commands the operator configured.
+FINAL_VERIFICATION_KINDS = (
+    "targeted",
+    "full",
+)
+
+
+# ================================================================
+# WORKER PERMISSION POSTURE
+# ================================================================
+#
+# An unattended worker cannot answer a permission prompt, and the only
+# two ways out of that are a bypass or a named posture. A bypass would
+# delete the boundary this whole control plane exists to hold, so the
+# posture is named here: one permission mode that never prompts, and
+# an allowlist of exactly the capabilities a phase of implementation
+# work needs.
+#
+# The allowlist is the security-relevant half. The denylist below it
+# is redundant against the read-only controller the session actually
+# gets, and is kept because a capability this dangerous should be
+# refused by every layer that can see it.
+
+WORKER_PERMISSION_MODE = "dontAsk"
+
+WORKER_ALLOWED_TOOLS = (
+    "Read",
+    "Glob",
+    "Grep",
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "TodoWrite",
+    "Bash(./.claude/bin/statusctl show)",
+    "Bash(./.claude/bin/statusctl report)",
+    "Bash(git status *)",
+    "Bash(git diff *)",
+    "Bash(git log *)",
+    "Bash(git show *)",
+    "Bash(git ls-files *)",
+    "Bash(git grep *)",
+    "Bash(PYTHONPATH=src .venv/bin/python -m pytest *)",
+    "Bash(.venv/bin/python -m pytest *)",
+    "Bash(.venv/bin/python -m py_compile *)",
+    "Bash(.venv/bin/python -m compileall *)",
+)
+
+WORKER_DISALLOWED_TOOLS = (
+    "Bash(./.claude/bin/statusctl start *)",
+    "Bash(./.claude/bin/statusctl start-integration *)",
+    "Bash(./.claude/bin/statusctl phase *)",
+    "Bash(./.claude/bin/statusctl test *)",
+    "Bash(./.claude/bin/statusctl test-not-required *)",
+    "Bash(./.claude/bin/statusctl gate *)",
+    "Bash(./.claude/bin/statusctl ready)",
+    "Bash(./.claude/bin/statusctl fail *)",
+    "Bash(./.claude/bin/statusctl migrate-v3 *)",
+    "Bash(statusctl *)",
+)
+
+
+def default_worker_argv():
+    """
+    The real worker: one Claude session, explicitly constrained.
+
+    The prompt is appended by the caller, so `-p` is deliberately last
+    — a variadic option such as --disallowedTools would otherwise
+    swallow the brief that follows it.
+    """
+
+    return [
+        "claude",
+        "--permission-mode",
+        WORKER_PERMISSION_MODE,
+        "--allowedTools",
+        ",".join(WORKER_ALLOWED_TOOLS),
+        "--disallowedTools",
+        ",".join(WORKER_DISALLOWED_TOOLS),
+        "-p",
+    ]
+
+
+# ================================================================
+# WORKER SESSION ISOLATION
+# ================================================================
+#
+# The worker performs the phase; it must not be able to say that it
+# did. Lifecycle transitions and test records are the evidence a human
+# reviews, so a session that could write them could also certify its
+# own work.
+#
+# The session therefore resolves `statusctl` — by name on PATH and by
+# the STATUSCTL pointer — to a shim that forwards read-only
+# subcommands and refuses everything else. A worker can still see the
+# task it is working on; it cannot change it.
+
+WORKER_SESSION_MARKER = "AUTOPILOT_WORKER_SESSION"
+
+WORKER_READ_ONLY_STATUSCTL_COMMANDS = (
+    "show",
+    "report",
+)
+
+WORKER_SHIM_EXIT_REFUSED = 111
+
+WORKER_SHIM_SOURCE = '''#!/usr/bin/env python3
+
+"""
+Read-only statusctl for an autopilot worker session.
+
+Lifecycle and evidence state belong to the orchestrator. A worker
+reports what it did; autopilot records it.
+"""
+
+import os
+import sys
+
+REAL = {real!r}
+
+READ_ONLY = {read_only!r}
+
+args = sys.argv[1:]
+
+if not args or args[0] not in READ_ONLY:
+    sys.stderr.write(
+        "autopilot: refused `statusctl "
+        + (" ".join(args) or "<no subcommand>")
+        + "` inside a worker session. This session cannot change "
+        "lifecycle or evidence state. Report the outcome to "
+        "autopilot instead; a Human Gate is requested by returning "
+        'outcome "HUMAN_GATE_REQUIRED", and autopilot alone opens '
+        "it.\\n"
+    )
+
+    raise SystemExit({exit_code})
+
+os.execv(REAL, [REAL] + args)
+'''
+
+
+# ================================================================
+# COMMAND GUARD
+# ================================================================
+
+
+class ForbiddenCommand(RuntimeError):
+    """
+    Raised when autopilot is asked to run a command that crosses a
+    Human Gate, human authority, or the sandbox boundary.
+    """
+
+
+# Permission bypass is refused wherever it appears in an argv, not
+# only in a known position, because the flag is what disables the
+# boundary regardless of which program consumes it.
+BYPASS_FLAGS = {
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+}
+
+BYPASS_SUBSTRINGS = (
+    "bypasspermissions",
+    "dangerously-skip-permissions",
+)
+
+FORBIDDEN_PROGRAMS = {
+    "sudo",
+    "su",
+    "doas",
+}
+
+# Every command autopilot runs is argv-only, so no runtime value can
+# be reinterpreted as shell syntax. That property survives only while
+# the program itself is not an interpreter of strings: `bash -c` as an
+# injected worker or verification command hands the whole guarantee
+# back. These wrappers are refused so the escape fails closed rather
+# than quietly restoring shell evaluation.
+SHELL_WRAPPER_PROGRAMS = {
+    "ash",
+    "bash",
+    "busybox",
+    "chroot",
+    "command",
+    "csh",
+    "dash",
+    "eval",
+    "exec",
+    "fish",
+    "flock",
+    "ksh",
+    "mksh",
+    "nice",
+    "nohup",
+    "rbash",
+    "script",
+    "setsid",
+    "sh",
+    "stdbuf",
+    "tcsh",
+    "time",
+    "timeout",
+    "unshare",
+    "watch",
+    "xargs",
+    "zsh",
+    "env",
+}
+
+# The same escape reached through an interpreter's inline-code flag.
+# Module and script invocation stay allowed: `python -m pytest` is how
+# verification actually runs.
+INLINE_CODE_FLAGS_BY_PROGRAM = {
+    "python": {
+        "-c",
+    },
+    "perl": {
+        "-e",
+        "-E",
+    },
+    "ruby": {
+        "-e",
+    },
+    "node": {
+        "-e",
+        "--eval",
+        "-p",
+        "--print",
+    },
+    "nodejs": {
+        "-e",
+        "--eval",
+        "-p",
+        "--print",
+    },
+    "php": {
+        "-r",
+    },
+}
+
+
+def inline_code_flags(program):
+    """
+    Resolve the inline-code flags for an interpreter basename.
+
+    Versioned names such as `python3.12` are matched by prefix so a
+    point release cannot slip past the closure.
+    """
+
+    for name, flags in INLINE_CODE_FLAGS_BY_PROGRAM.items():
+        if program == name or program.startswith(name):
+            return flags
+
+    return set()
+
+# Human authority. Autopilot may open a gate; only a human may
+# resolve one.
+FORBIDDEN_STATUSCTL_GATE_ACTIONS = {
+    "approve",
+    "alternative",
+    "reject",
+}
+
+# Operator authority. Migration rewrites the operator's canonical
+# runtime state, so it is never autonomous.
+FORBIDDEN_STATUSCTL_COMMANDS = {
+    "migrate-v3",
+}
+
+# Git is allowlisted rather than denylisted: an integration or
+# destructive subcommand that nobody thought to enumerate must fail
+# closed, not pass by omission.
+READ_ONLY_GIT_SUBCOMMANDS = {
+    "status",
+    "diff",
+    "log",
+    "show",
+    "describe",
+    "rev-parse",
+    "ls-files",
+    "blame",
+    "cat-file",
+    "symbolic-ref",
+    "shortlog",
+}
+
+
+def assert_command_allowed(argv):
+    """
+    Fail closed on any command autopilot must never run.
+
+    This guard is a backstop, not the primary control. Sandbox
+    enforcement and the permission denies in .claude/settings.json
+    remain the boundary; this exists so an unattended orchestrator
+    refuses the command outright instead of discovering the boundary
+    by tripping over it mid-run.
+    """
+
+    if not argv:
+        raise ForbiddenCommand(
+            "Refusing to run an empty command."
+        )
+
+    for token in argv:
+        lowered = str(token).lower()
+
+        if lowered in BYPASS_FLAGS:
+            raise ForbiddenCommand(
+                f"Refusing permission-bypass flag: {token}"
+            )
+
+        for fragment in BYPASS_SUBSTRINGS:
+            if fragment in lowered:
+                raise ForbiddenCommand(
+                    "Refusing permission-bypass argument: "
+                    f"{token}"
+                )
+
+    program = Path(str(argv[0])).name
+
+    if program in FORBIDDEN_PROGRAMS:
+        raise ForbiddenCommand(
+            f"Refusing privileged program: {program}"
+        )
+
+    if program in SHELL_WRAPPER_PROGRAMS:
+        raise ForbiddenCommand(
+            f"Refusing shell or wrapper program: {program}. "
+            "Commands are argv-only; pass the real program "
+            "directly."
+        )
+
+    rest = [
+        str(token)
+        for token in argv[1:]
+    ]
+
+    inline = inline_code_flags(program)
+
+    for token in rest:
+        if token in inline:
+            raise ForbiddenCommand(
+                f"Refusing inline-code flag {token} for "
+                f"{program}: it reintroduces string evaluation."
+            )
+
+    if program == "statusctl":
+        if rest[:1] and rest[0] in FORBIDDEN_STATUSCTL_COMMANDS:
+            raise ForbiddenCommand(
+                f"statusctl {rest[0]} is operator-initiated and "
+                "must never be run autonomously."
+            )
+
+        if (
+            rest[:1] == ["gate"]
+            and rest[1:2]
+            and rest[1] in FORBIDDEN_STATUSCTL_GATE_ACTIONS
+        ):
+            raise ForbiddenCommand(
+                f"statusctl gate {rest[1]} is human authority and "
+                "must never be run by autopilot."
+            )
+
+    if program == "git":
+        subcommand = None
+
+        for token in rest:
+            if not token.startswith("-"):
+                subcommand = token
+                break
+
+        if subcommand not in READ_ONLY_GIT_SUBCOMMANDS:
+            raise ForbiddenCommand(
+                "Refusing non-read-only git subcommand: "
+                f"{subcommand}"
+            )
+
+    return argv
+
+
+def flag_value(argv, flag):
+    tokens = [
+        str(token)
+        for token in argv
+    ]
+
+    for index, token in enumerate(tokens):
+        if (
+            token == flag
+            and index + 1 < len(tokens)
+        ):
+            return tokens[index + 1]
+
+    return None
+
+
+def assert_worker_command_allowed(argv):
+    """
+    Additionally hold the worker to its permission posture.
+
+    A Claude worker is the only worker that can prompt, so it is the
+    one that must carry an explicit non-prompting permission mode and
+    a named capability allowlist. Enforcing this on the resolved argv
+    rather than only on the default means an injected worker cannot
+    quietly drop the posture and reintroduce interactive approval —
+    which, in an unattended run, means an indefinite stall or a
+    pressure to bypass.
+    """
+
+    assert_command_allowed(argv)
+
+    program = Path(str(argv[0])).name
+
+    if program == "autopilot":
+        raise ForbiddenCommand(
+            "Refusing a worker that re-enters autopilot."
+        )
+
+    if program != "claude":
+        return argv
+
+    mode = flag_value(
+        argv,
+        "--permission-mode",
+    )
+
+    if mode != WORKER_PERMISSION_MODE:
+        raise ForbiddenCommand(
+            "A claude worker must run with --permission-mode "
+            f"{WORKER_PERMISSION_MODE}, got {mode!r}."
+        )
+
+    if not flag_value(
+        argv,
+        "--allowedTools",
+    ):
+        raise ForbiddenCommand(
+            "A claude worker must pre-authorize its capabilities "
+            "with --allowedTools."
+        )
+
+    if not flag_value(
+        argv,
+        "--disallowedTools",
+    ):
+        raise ForbiddenCommand(
+            "A claude worker must deny lifecycle-changing "
+            "capabilities with --disallowedTools."
+        )
+
+    return argv
+
+
+# ================================================================
+# CONCURRENCY
+# ================================================================
+
+
+def lock_path(root):
+    """
+    Autopilot's own lock, keyed by worktree and stored outside the
+    repository.
+
+    It is deliberately a different file from the statusctl lock.
+    Autopilot holds this lock for a whole run while shelling out to
+    statusctl many times; sharing one lock would deadlock the
+    controller against its own orchestrator.
+    """
+
+    key = hashlib.sha256(
+        str(Path(root).resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+
+    return (
+        Path(tempfile.gettempdir())
+        / f"cryptolab-autopilot-{key}.lock"
+    )
+
+
+class ConcurrentRun(RuntimeError):
+    """
+    Raised when another autopilot already drives this worktree.
+    """
+
+
+@contextmanager
+def autopilot_lock(root):
+    path = lock_path(root)
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    handle = path.open("a+")
+
+    try:
+        deadline = (
+            time.monotonic()
+            + LOCK_TIMEOUT_SECONDS
+        )
+
+        while True:
+            try:
+                fcntl.flock(
+                    handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                break
+
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ConcurrentRun(
+                        "Another autopilot holds the run lock "
+                        f"after {LOCK_TIMEOUT_SECONDS:.1f}s: "
+                        f"{path}"
+                    )
+
+                time.sleep(LOCK_RETRY_SECONDS)
+
+        try:
+            yield
+
+        finally:
+            fcntl.flock(
+                handle.fileno(),
+                fcntl.LOCK_UN,
+            )
+
+    finally:
+        handle.close()
+
+
+# ================================================================
+# CONTROL FLOW SIGNALS
+# ================================================================
+
+
+class Stop(Exception):
+    """
+    A run outcome that ends the cycle loop.
+
+    Carrying the exit code on the exception keeps every stop reason in
+    one place, so no branch can end a run without also deciding what
+    the supervisor should see.
+    """
+
+    def __init__(
+        self,
+        result,
+        exit_code,
+        detail,
+        **extra,
+    ):
+        super().__init__(detail)
+
+        self.result = result
+        self.exit_code = exit_code
+        self.detail = detail
+        self.extra = extra
+
+
+def blocked(detail, **extra):
+    return Stop(
+        "BLOCKED",
+        EXIT_BLOCKED_TECHNICAL,
+        detail,
+        **extra,
+    )
+
+
+def refused(detail, **extra):
+    return Stop(
+        "REFUSED",
+        EXIT_BLOCKED_PERMISSION,
+        detail,
+        **extra,
+    )
+
+
+# ================================================================
+# SUBPROCESS HELPERS
+# ================================================================
+
+
+def run_guarded(
+    argv,
+    timeout,
+    cwd=None,
+    env=None,
+):
+    """
+    Run a guarded command with stdin closed and a hard timeout.
+
+    stdin is DEVNULL rather than inherited: an unattended run must
+    never be able to sit waiting on input that will never arrive.
+    """
+
+    assert_command_allowed(argv)
+
+    return subprocess.run(
+        [
+            str(token)
+            for token in argv
+        ],
+        cwd=str(cwd or ROOT),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+        stdin=subprocess.DEVNULL,
+        env=env,
+    )
+
+
+def statusctl(*args):
+    """
+    Invoke the canonical controller.
+
+    Autopilot never writes runtime state itself. statusctl is the only
+    trusted write path, and it revalidates every transition.
+    """
+
+    argv = [
+        str(STATUSCTL),
+        *args,
+    ]
+
+    try:
+        completed = run_guarded(
+            argv,
+            timeout=STATUSCTL_TIMEOUT_SECONDS,
+        )
+
+    except subprocess.TimeoutExpired:
+        raise blocked(
+            "statusctl timeout after "
+            f"{STATUSCTL_TIMEOUT_SECONDS:.0f}s: "
+            + " ".join(args)
+        )
+
+    except FileNotFoundError:
+        raise blocked(
+            f"statusctl is not executable at {STATUSCTL}."
+        )
+
+    return completed
+
+
+def statusctl_checked(*args):
+    completed = statusctl(*args)
+
+    if completed.returncode != 0:
+        raise blocked(
+            "statusctl "
+            + " ".join(args[:2])
+            + " failed: "
+            + (
+                completed.stderr.strip()
+                or completed.stdout.strip()
+                or f"exit {completed.returncode}"
+            )
+        )
+
+    return completed
+
+
+def read_runtime():
+    """
+    Read canonical runtime state through the controller.
+
+    Reading through statusctl rather than parsing status.json keeps
+    autopilot behind the same fail-closed validation as every other
+    consumer: a corrupt or unsupported runtime stops the run instead
+    of being interpreted.
+    """
+
+    completed = statusctl("show")
+
+    if completed.returncode != 0:
+        raise blocked(
+            "Cannot read runtime state: "
+            + (
+                completed.stderr.strip()
+                or completed.stdout.strip()
+                or f"statusctl show exit "
+                f"{completed.returncode}"
+            )
+        )
+
+    try:
+        return json.loads(completed.stdout)
+
+    except json.JSONDecodeError as error:
+        raise blocked(
+            f"statusctl show returned unparseable state: {error}"
+        )
+
+
+# ================================================================
+# WORKER
+# ================================================================
+
+
+def worker_argv():
+    """
+    Resolve the worker command.
+
+    The worker is injectable so that the orchestrator can be tested
+    without credentials, a network, or a real Claude session.
+    """
+
+    raw = os.environ.get("AUTOPILOT_WORKER")
+
+    if not raw:
+        return default_worker_argv()
+
+    try:
+        parsed = json.loads(raw)
+
+    except json.JSONDecodeError as error:
+        raise blocked(
+            f"AUTOPILOT_WORKER is not valid JSON: {error}"
+        )
+
+    if (
+        not isinstance(parsed, list)
+        or not parsed
+        or not all(
+            isinstance(token, str)
+            for token in parsed
+        )
+    ):
+        raise blocked(
+            "AUTOPILOT_WORKER must be a non-empty JSON array of "
+            "strings."
+        )
+
+    return parsed
+
+
+def positive_float(name, default):
+    raw = os.environ.get(name)
+
+    if not raw:
+        return default
+
+    try:
+        value = float(raw)
+
+    except ValueError:
+        raise blocked(
+            f"{name} must be a number, got {raw!r}."
+        )
+
+    if value <= 0:
+        raise blocked(
+            f"{name} must be greater than zero, got {raw!r}."
+        )
+
+    return value
+
+
+def build_brief(runtime):
+    """
+    Describe exactly one phase of work to the worker.
+
+    The brief is a single argv element so that the worker command
+    stays argv-only. No shell string is ever constructed, so no part
+    of the runtime state can be interpreted as shell syntax.
+    """
+
+    return json.dumps(
+        {
+            "contract": CONTRACT,
+            "task_id": runtime.get("task_id"),
+            "task_title": runtime.get("task_title"),
+            "task_kind": runtime.get("task_kind"),
+            "parent_task_id": runtime.get("parent_task_id"),
+            "phase": runtime.get("phase"),
+            "instruction": (
+                "Perform only the current phase of the approved "
+                "task, following the operating contract. The "
+                "orchestrator owns phase transitions, test records "
+                "and Human Gates: statusctl is read-only in this "
+                "session, so request a gate by returning outcome "
+                "HUMAN_GATE_REQUIRED rather than opening one. Do "
+                "not perform any gated action. Reply with one "
+                "final line of JSON."
+            ),
+            "response_schema": {
+                "outcome": (
+                    "PASS | HUMAN_GATE_REQUIRED | BLOCKED"
+                ),
+                "summary": "one line describing what was done",
+                "gate_type": (
+                    "required when outcome is HUMAN_GATE_REQUIRED"
+                ),
+                "question": (
+                    "required when outcome is HUMAN_GATE_REQUIRED"
+                ),
+                "recommendation": (
+                    "required when outcome is HUMAN_GATE_REQUIRED"
+                ),
+                "alternatives": "optional list of strings",
+                "risks": "optional list of strings",
+            },
+        },
+        sort_keys=True,
+    )
+
+
+def parse_worker_response(stdout):
+    """
+    Extract the worker's structured outcome, failing closed.
+
+    Scanning backwards for the last JSON object carrying an "outcome"
+    lets a conversational worker narrate freely before its verdict.
+    Output that contains no such object is a failure, never a silent
+    success: an unparseable worker must not be read as approval.
+    """
+
+    for line in reversed(stdout.splitlines()):
+        stripped = line.strip()
+
+        if not stripped.startswith("{"):
+            continue
+
+        try:
+            candidate = json.loads(stripped)
+
+        except json.JSONDecodeError:
+            continue
+
+        if (
+            isinstance(candidate, dict)
+            and "outcome" in candidate
+        ):
+            return candidate
+
+    raise blocked(
+        "Worker produced no parseable outcome. Refusing to treat "
+        "unstructured output as success.",
+        worker_stdout_tail=stdout[-500:],
+    )
+
+
+def worker_environment(shim):
+    """
+    Build the environment the worker session runs in.
+
+    Two things are removed and one is added. Autopilot's own
+    configuration goes, so a worker cannot read the orchestrator's
+    settings or relaunch it with a worker of its choosing. The
+    controller is redirected to the read-only shim, both by name on
+    PATH and through the STATUSCTL pointer, so the ordinary ways of
+    reaching it land somewhere that cannot write. The session marker
+    is added so a nested autopilot refuses to start at all.
+    """
+
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("AUTOPILOT_")
+    }
+
+    directory = str(Path(shim).parent)
+
+    existing = environment.get("PATH", "")
+
+    environment["PATH"] = (
+        directory + os.pathsep + existing
+        if existing
+        else directory
+    )
+
+    environment["STATUSCTL"] = str(shim)
+
+    environment[WORKER_SESSION_MARKER] = "1"
+
+    return environment
+
+
+@contextmanager
+def worker_session():
+    """
+    Provide a read-only controller and the environment that uses it.
+
+    The shim lives outside the repository for the duration of one
+    worker invocation, so nothing is left behind that a later process
+    could resolve `statusctl` to by accident.
+    """
+
+    with tempfile.TemporaryDirectory(
+        prefix="autopilot-worker-",
+    ) as directory:
+        shim = Path(directory) / "statusctl"
+
+        shim.write_text(
+            WORKER_SHIM_SOURCE.format(
+                real=str(STATUSCTL),
+                read_only=WORKER_READ_ONLY_STATUSCTL_COMMANDS,
+                exit_code=WORKER_SHIM_EXIT_REFUSED,
+            )
+        )
+
+        shim.chmod(0o755)
+
+        yield worker_environment(shim)
+
+
+def invoke_worker(runtime, timeout):
+    argv = [
+        *worker_argv(),
+        build_brief(runtime),
+    ]
+
+    try:
+        assert_worker_command_allowed(argv)
+
+    except ForbiddenCommand as error:
+        raise refused(
+            f"Worker command refused by the guard: {error}"
+        )
+
+    started = time.monotonic()
+
+    try:
+        with worker_session() as environment:
+            completed = run_guarded(
+                argv,
+                timeout=timeout,
+                env=environment,
+            )
+
+    except subprocess.TimeoutExpired:
+        raise blocked(
+            f"Worker timeout after {timeout:.0f}s in phase "
+            f"{runtime.get('phase')}."
+        )
+
+    except FileNotFoundError:
+        raise blocked(
+            f"Worker command not found: {argv[0]}"
+        )
+
+    except PermissionError:
+        raise refused(
+            f"Worker command is not executable: {argv[0]}"
+        )
+
+    elapsed = time.monotonic() - started
+
+    if completed.returncode != 0:
+        raise blocked(
+            "Worker exited "
+            f"{completed.returncode} in phase "
+            f"{runtime.get('phase')} after {elapsed:.1f}s.",
+            worker_stderr_tail=completed.stderr[-500:],
+        )
+
+    return parse_worker_response(completed.stdout)
+
+
+# ================================================================
+# VERIFICATION
+# ================================================================
+
+
+def verify_argv(kind):
+    """
+    Resolve the operator-configured verification command, if any.
+
+    Verification is orchestrator-run by design: the worker's own
+    claim that tests passed is never recorded as a test result.
+    """
+
+    raw = os.environ.get(
+        f"AUTOPILOT_VERIFY_{kind.upper()}"
+    )
+
+    if not raw:
+        return None
+
+    try:
+        parsed = json.loads(raw)
+
+    except json.JSONDecodeError as error:
+        raise blocked(
+            f"AUTOPILOT_VERIFY_{kind.upper()} is not valid JSON: "
+            f"{error}"
+        )
+
+    if (
+        not isinstance(parsed, list)
+        or not parsed
+        or not all(
+            isinstance(token, str)
+            for token in parsed
+        )
+    ):
+        raise blocked(
+            f"AUTOPILOT_VERIFY_{kind.upper()} must be a non-empty "
+            "JSON array of strings."
+        )
+
+    return parsed
+
+
+def run_verification(kind, phase):
+    """
+    Run verification and record the real outcome.
+
+    A FAIL is recorded as FAIL and stops the run. Autopilot never
+    records NOT_REQUIRED: deciding that a test category does not
+    apply is a judgement about the task, and an orchestrator that
+    could make it would be able to exempt itself from testing.
+
+    When no verification command is configured, nothing is recorded.
+    The task simply cannot complete: statusctl `ready` is fail-closed
+    on a missing test record, so an unverified task can never reach
+    READY_FOR_HUMAN_REVIEW by omission.
+    """
+
+    argv = verify_argv(kind)
+
+    if argv is None:
+        return {
+            "kind": kind,
+            "status": "NOT_ORCHESTRATOR_RUN",
+            "detail": (
+                f"No AUTOPILOT_VERIFY_{kind.upper()} command is "
+                "configured, so autopilot recorded no result."
+            ),
+        }
+
+    timeout = positive_float(
+        "AUTOPILOT_VERIFY_TIMEOUT",
+        DEFAULT_VERIFY_TIMEOUT_SECONDS,
+    )
+
+    printable = " ".join(argv)
+
+    try:
+        completed = run_guarded(
+            argv,
+            timeout=timeout,
+        )
+
+    except ForbiddenCommand as error:
+        raise refused(
+            f"Verification command refused by the guard: {error}"
+        )
+
+    except subprocess.TimeoutExpired:
+        raise blocked(
+            f"Verification timeout after {timeout:.0f}s in phase "
+            f"{phase}: {printable}"
+        )
+
+    except FileNotFoundError:
+        raise blocked(
+            f"Verification command not found: {argv[0]}"
+        )
+
+    passed = completed.returncode == 0
+
+    summary = summarize_verification(
+        completed,
+        phase,
+        passed,
+    )
+
+    statusctl_checked(
+        "test",
+        kind,
+        "PASS" if passed else "FAIL",
+        printable,
+        summary,
+    )
+
+    if not passed:
+        raise blocked(
+            f"Verification FAILED in phase {phase}: {printable}",
+            verification={
+                "kind": kind,
+                "status": "FAIL",
+                "command": printable,
+                "summary": summary,
+            },
+        )
+
+    return {
+        "kind": kind,
+        "status": "PASS",
+        "command": printable,
+        "summary": summary,
+    }
+
+
+def run_final_verification(runtime):
+    """
+    Re-establish both verification results at FINAL_VERIFY.
+
+    `statusctl ready` checks that a passing record exists, not that it
+    is current. A task can therefore arrive at completion carrying
+    results recorded phases earlier, before the corrections that
+    followed them — which is exactly the evidence a human reviewer
+    would assume is fresh.
+
+    So both are run again here, from operator-configured commands, and
+    both are recorded again. A missing command is a hard stop rather
+    than a silent omission: the alternative is completing on evidence
+    nobody produced.
+
+    An Integration Task is exempt because it never re-tests product
+    code (CLAUDE.md 2A). Its completion still has to satisfy
+    statusctl's own fail-closed `ready` checks, which autopilot cannot
+    supply for it — an integration run that lacks the records simply
+    stops.
+    """
+
+    task_kind = runtime.get("task_kind")
+
+    if task_kind != "WORK":
+        return None
+
+    missing = [
+        kind
+        for kind in FINAL_VERIFICATION_KINDS
+        if verify_argv(kind) is None
+    ]
+
+    if missing:
+        raise blocked(
+            "FINAL_VERIFY requires a verification command for "
+            + " and ".join(
+                f"AUTOPILOT_VERIFY_{kind.upper()}"
+                for kind in missing
+            )
+            + ". Autopilot will not complete a task on evidence it "
+            "did not produce."
+        )
+
+    return [
+        run_verification(
+            kind,
+            "FINAL_VERIFY",
+        )
+        for kind in FINAL_VERIFICATION_KINDS
+    ]
+
+
+def summarize_verification(completed, phase, passed):
+    tail = (
+        completed.stdout.strip().splitlines()
+        or completed.stderr.strip().splitlines()
+    )
+
+    last = tail[-1].strip() if tail else ""
+
+    return (
+        f"{phase}: "
+        + ("PASS" if passed else "FAIL")
+        + f" (exit {completed.returncode})"
+        + (f" — {last}" if last else "")
+    )[:400]
+
+
+# ================================================================
+# GATE OPENING
+# ================================================================
+
+
+def open_gate(response):
+    """
+    Open a Human Gate on the worker's behalf and stop.
+
+    Opening a gate is autonomous; resolving one is not. Autopilot
+    reads the resulting gate ID back out of runtime state rather than
+    inventing or echoing one, so the ID a supervisor sees is the ID
+    the controller actually assigned.
+    """
+
+    gate_type = response.get("gate_type")
+
+    if gate_type not in VALID_GATE_TYPES:
+        raise blocked(
+            "Worker requested a Human Gate with an invalid "
+            f"gate_type: {gate_type!r}."
+        )
+
+    question = (response.get("question") or "").strip()
+    recommendation = (
+        response.get("recommendation") or ""
+    ).strip()
+
+    if not question or not recommendation:
+        raise blocked(
+            "Worker requested a Human Gate without a question and "
+            "a recommendation."
+        )
+
+    argv = [
+        "gate",
+        "open",
+        gate_type,
+        question,
+        recommendation,
+    ]
+
+    for alternative in response.get("alternatives") or []:
+        argv.extend(
+            [
+                "--alternative",
+                str(alternative),
+            ]
+        )
+
+    for risk in response.get("risks") or []:
+        argv.extend(
+            [
+                "--risk",
+                str(risk),
+            ]
+        )
+
+    statusctl_checked(*argv)
+
+    runtime = read_runtime()
+
+    gate = runtime.get("human_gate")
+
+    if not gate:
+        raise blocked(
+            "statusctl accepted the gate but runtime state shows "
+            "no active Human Gate."
+        )
+
+    raise Stop(
+        "WAITING_FOR_HUMAN",
+        EXIT_WAITING_FOR_HUMAN,
+        (
+            f"Human Gate {gate['gate_id']} is open and must be "
+            "resolved by a human."
+        ),
+        human_gate=gate,
+        state=runtime.get("state"),
+    )
+
+
+# ================================================================
+# CYCLE
+# ================================================================
+
+
+def next_phase(runtime):
+    task_kind = runtime.get("task_kind")
+
+    sequence = SEQUENCE_BY_TASK_KIND.get(task_kind)
+
+    if sequence is None:
+        raise blocked(
+            f"Unsupported task_kind: {task_kind!r}."
+        )
+
+    phase = runtime.get("phase")
+
+    if phase not in sequence:
+        raise blocked(
+            f"Phase {phase!r} is not part of the {task_kind} "
+            "lifecycle."
+        )
+
+    index = sequence.index(phase)
+
+    if index + 1 >= len(sequence):
+        return None
+
+    return sequence[index + 1]
+
+
+def failed_test_kinds(runtime):
+    tests = runtime.get("tests") or {}
+
+    return [
+        kind
+        for kind in (
+            "targeted",
+            "full",
+        )
+        if (tests.get(kind) or {}).get("result") == "FAIL"
+    ]
+
+
+def check_can_continue(runtime):
+    """
+    Decide, from durable state alone, whether the run may proceed.
+
+    This runs before the worker is invoked, so a gate opened by
+    anyone — this session, another session, or a human — stops the
+    run without spending a worker cycle on work that is not
+    authorized to continue.
+    """
+
+    state = runtime.get("state")
+
+    if state == "BLOCKED_HUMAN_DECISION":
+        gate = runtime.get("human_gate") or {}
+
+        raise Stop(
+            "WAITING_FOR_HUMAN",
+            EXIT_WAITING_FOR_HUMAN,
+            (
+                f"Human Gate {gate.get('gate_id')} is open and "
+                "must be resolved by a human."
+            ),
+            human_gate=gate,
+            state=state,
+        )
+
+    if state == "IDLE":
+        raise blocked(
+            "No task is running. Start one with statusctl before "
+            "running autopilot.",
+            state=state,
+        )
+
+    if state == "READY_FOR_HUMAN_REVIEW":
+        raise Stop(
+            "WAITING_FOR_HUMAN",
+            EXIT_WAITING_FOR_HUMAN,
+            (
+                "Task is READY_FOR_HUMAN_REVIEW. Human review is "
+                "the next step."
+            ),
+            state=state,
+        )
+
+    if state == "FAILED":
+        raise blocked(
+            "Task is FAILED and cannot be continued "
+            "autonomously.",
+            state=state,
+        )
+
+    if state != "RUNNING":
+        raise blocked(
+            f"Unsupported runtime state: {state!r}.",
+            state=state,
+        )
+
+    failed = failed_test_kinds(runtime)
+
+    if failed:
+        raise blocked(
+            "Runtime records a FAILED test requirement "
+            f"({', '.join(failed)}). Refusing to advance past a "
+            "recorded failure.",
+            state=state,
+        )
+
+    phase = runtime.get("phase")
+
+    if phase in EXTERNAL_WAIT_PHASES:
+        raise Stop(
+            "WAITING_EXTERNAL",
+            EXIT_WAITING_EXTERNAL,
+            (
+                f"Phase {phase} requires an independent reviewer. "
+                "Autopilot does not perform it and does not "
+                "advance past it."
+            ),
+            state=state,
+        )
+
+
+def observe_after_worker(task_id, phase, observed_at):
+    """
+    Re-derive runtime state after the worker ran.
+
+    The worker session cannot reach a writable controller, so runtime
+    state must be byte-for-byte as autopilot left it. `updated_at`
+    moves on every accepted transition, which makes it the cheapest
+    honest witness that something wrote: if it changed, some process
+    outside this orchestrator's control drove the lifecycle during the
+    cycle.
+
+    That is refused rather than accommodated. Autopilot may only build
+    on state it observed, and a mutation it did not perform means the
+    isolation it depends on did not hold — advancing would launder the
+    violation into a phase transition. The individual checks below
+    remain as backstops for anything that could change state without
+    moving the timestamp.
+    """
+
+    runtime = read_runtime()
+
+    state = runtime.get("state")
+
+    if (
+        observed_at is not None
+        and runtime.get("updated_at") != observed_at
+    ):
+        gate = runtime.get("human_gate")
+
+        raise refused(
+            "Runtime state was mutated during the worker cycle in "
+            f"phase {phase}. The worker session may not change "
+            "lifecycle or evidence state, and autopilot will not "
+            "advance from state it did not observe.",
+            state=state,
+            human_gate=gate,
+            observed_updated_at=observed_at,
+            actual_updated_at=runtime.get("updated_at"),
+        )
+
+    if runtime.get("task_id") != task_id:
+        raise blocked(
+            "Runtime task changed during the cycle: expected "
+            f"{task_id!r}, found {runtime.get('task_id')!r}."
+        )
+
+    if state == "BLOCKED_HUMAN_DECISION":
+        gate = runtime.get("human_gate") or {}
+
+        raise Stop(
+            "WAITING_FOR_HUMAN",
+            EXIT_WAITING_FOR_HUMAN,
+            (
+                f"Worker opened Human Gate {gate.get('gate_id')}, "
+                "which must be resolved by a human."
+            ),
+            human_gate=gate,
+            state=state,
+        )
+
+    if state != "RUNNING":
+        raise blocked(
+            f"Runtime state became {state!r} during the worker "
+            "cycle.",
+            state=state,
+        )
+
+    if runtime.get("phase") != phase:
+        raise blocked(
+            "Worker changed the runtime phase from "
+            f"{phase!r} to {runtime.get('phase')!r}. The "
+            "orchestrator owns phase transitions."
+        )
+
+    failed = failed_test_kinds(runtime)
+
+    if failed:
+        raise blocked(
+            "Worker recorded a FAILED test requirement "
+            f"({', '.join(failed)}) in phase {phase}."
+        )
+
+    return runtime
+
+
+def assert_no_worktree_damage():
+    """
+    Run the contract's own pre-completion check before `ready`.
+
+    This is orchestrator-run on purpose. `statusctl ready` validates
+    runtime state, but nothing in the runtime record can tell it
+    whether the worktree itself is sound.
+    """
+
+    argv = [
+        "git",
+        "diff",
+        "--check",
+    ]
+
+    try:
+        completed = run_guarded(
+            argv,
+            timeout=STATUSCTL_TIMEOUT_SECONDS,
+        )
+
+    except ForbiddenCommand as error:
+        raise refused(
+            f"Completion check refused by the guard: {error}"
+        )
+
+    except subprocess.TimeoutExpired:
+        raise blocked(
+            "git diff --check timed out before completion."
+        )
+
+    except FileNotFoundError:
+        raise blocked(
+            "git is unavailable, so the pre-completion worktree "
+            "check could not be performed."
+        )
+
+    if completed.returncode != 0:
+        raise blocked(
+            "git diff --check reported whitespace or conflict "
+            "damage: "
+            + (
+                completed.stdout.strip()
+                or completed.stderr.strip()
+            )[:400]
+        )
+
+
+# ================================================================
+# UNTRACKED WORKTREE BASELINE
+# ================================================================
+#
+# `git diff --check` inspects tracked content, so completion gated on
+# it alone is blind to everything a run leaves *beside* the
+# repository: a scratch file, an editor directory, a half-written
+# export. That is the class of artifact a human reviewing a diff
+# never sees, which is exactly why it must not be the class autopilot
+# fails to notice.
+#
+# So the untracked set is inventoried once, at process start, and
+# compared again immediately before `ready`. An entry present at
+# completion that the baseline did not carry is contamination and
+# stops the run.
+#
+# The baseline is deliberately never refreshed after the worker runs.
+# A baseline re-read mid-run would absorb whatever the worker had
+# just created and then certify a clean tree — it would agree with
+# anything, which is the same as checking nothing.
+#
+# Entries the baseline already carried stay allowed. A task
+# legitimately begins with untracked work in progress, and this check
+# is about what the run added, not about tidiness.
+
+# `--directory` collapses a wholly untracked directory into a single
+# entry, which is also what makes an empty one visible at all: `git
+# status` omits it and `git diff --check` cannot see it. `-z` keeps
+# paths unambiguous, since a filename may legally contain a newline.
+UNTRACKED_ENTRIES_ARGV = [
+    "git",
+    "ls-files",
+    "--others",
+    "--directory",
+    "--exclude-standard",
+    "-z",
+]
+
+MAX_REPORTED_CONTAMINATION = 20
+
+
+def is_material_entry(path):
+    """
+    Whether an untracked entry is a real worktree artifact.
+
+    The single exemption is for entries that are neither regular
+    files nor directories. A sandboxed run sees denied paths masked
+    onto /dev/null, which arrive as character devices; those belong
+    to the sandbox rather than to the work, and mistaking one for a
+    stray artifact would block completion for a reason no worker
+    could fix.
+
+    Symlinks are resolved rather than skipped, so a mask is exempt
+    while a link to real content is not. Anything that cannot be
+    inspected counts as material: git listed it, so something is
+    there, and an entry that resists classification must not be
+    assumed harmless.
+    """
+
+    try:
+        info = os.stat(path)
+
+    except OSError:
+        return True
+
+    return bool(
+        stat.S_ISREG(info.st_mode)
+        or stat.S_ISDIR(info.st_mode)
+    )
+
+
+def untracked_entries():
+    """
+    Inventory the untracked entries git currently reports.
+
+    Read through git rather than by walking the tree, so the
+    repository's own ignore rules decide what counts — runtime
+    artifacts and caches are ignored files, not contamination.
+    """
+
+    try:
+        completed = run_guarded(
+            UNTRACKED_ENTRIES_ARGV,
+            timeout=STATUSCTL_TIMEOUT_SECONDS,
+        )
+
+    except ForbiddenCommand as error:
+        raise refused(
+            "Worktree inventory refused by the guard: "
+            f"{error}"
+        )
+
+    except subprocess.TimeoutExpired:
+        raise blocked(
+            "git ls-files timed out while inventorying "
+            "untracked worktree entries."
+        )
+
+    except FileNotFoundError:
+        raise blocked(
+            "git is unavailable, so untracked worktree entries "
+            "could not be inventoried."
+        )
+
+    if completed.returncode != 0:
+        raise blocked(
+            "git ls-files failed while inventorying untracked "
+            "worktree entries: "
+            + (
+                completed.stderr.strip()
+                or completed.stdout.strip()
+                or f"exit {completed.returncode}"
+            )[:400]
+        )
+
+    return {
+        entry
+        for entry in completed.stdout.split("\0")
+        if entry
+        and is_material_entry(ROOT / entry)
+    }
+
+
+def assert_worktree_uncontaminated(baseline):
+    """
+    Refuse completion when the run added untracked entries.
+
+    A missing baseline is refused rather than treated as empty: with
+    no snapshot to compare against, every pre-existing artifact would
+    read as contamination and the check would be meaningless in the
+    other direction too.
+    """
+
+    if baseline is None:
+        raise blocked(
+            "No untracked worktree baseline was taken at process "
+            "start, so completion cannot be checked for "
+            "contamination."
+        )
+
+    appeared = sorted(
+        untracked_entries()
+        - baseline
+    )
+
+    if appeared:
+        raise blocked(
+            "Untracked entries appeared during the run and must be "
+            "resolved before completion: "
+            + ", ".join(
+                appeared[:MAX_REPORTED_CONTAMINATION]
+            ),
+            contamination=appeared,
+        )
+
+
+def assert_completion_preconditions(baseline):
+    """
+    Hold the worktree to both completion checks before `ready`.
+
+    Damage to tracked content and contamination beside it are
+    different failures with different evidence, and neither one
+    implies the other: `git diff --check` passes cleanly on a tree
+    with a stray file in it.
+    """
+
+    assert_no_worktree_damage()
+
+    assert_worktree_uncontaminated(baseline)
+
+
+def run_cycle(runtime, timeout, baseline):
+    """
+    Perform one phase and advance exactly one step.
+
+    The phase is advanced only after the worker reports success, so a
+    worker failure leaves runtime state exactly where it was.
+    """
+
+    phase = runtime.get("phase")
+    task_id = runtime.get("task_id")
+    observed_at = runtime.get("updated_at")
+
+    response = invoke_worker(
+        runtime,
+        timeout,
+    )
+
+    outcome = str(
+        response.get("outcome") or ""
+    ).upper()
+
+    if outcome == "HUMAN_GATE_REQUIRED":
+        open_gate(response)
+
+    if outcome != "PASS":
+        raise blocked(
+            f"Worker reported outcome {outcome!r} in phase "
+            f"{phase}: "
+            + str(
+                response.get("summary") or ""
+            ).strip(),
+        )
+
+    runtime = observe_after_worker(
+        task_id,
+        phase,
+        observed_at,
+    )
+
+    verification = None
+
+    kind = VERIFY_PHASES.get(phase)
+
+    if kind is not None:
+        verification = run_verification(
+            kind,
+            phase,
+        )
+
+    following = next_phase(runtime)
+
+    if following is None:
+        # Order matters: fresh evidence first, then the worktree
+        # check the contract requires, then a report that describes
+        # both, and only then completion.
+        verification = run_final_verification(runtime)
+
+        assert_completion_preconditions(baseline)
+
+        statusctl_checked("report")
+
+        statusctl_checked("ready")
+
+        raise Stop(
+            "READY_FOR_HUMAN_REVIEW",
+            EXIT_OK,
+            (
+                "Task reached READY_FOR_HUMAN_REVIEW. Integration "
+                "remains a Human Gate."
+            ),
+            verification=verification,
+        )
+
+    statusctl_checked(
+        "phase",
+        following,
+    )
+
+    return {
+        "phase": following,
+        "verification": verification,
+        "summary": str(
+            response.get("summary") or ""
+        ).strip(),
+    }
+
+
+def drive(max_cycles, timeout, baseline):
+    """
+    Run cycles until a stop condition or the cycle budget.
+
+    Every cycle re-reads canonical runtime state rather than carrying
+    a phase forward in memory. Autopilot keeps no conversational
+    memory, so a fresh process resumes to the same conclusion.
+
+    The untracked baseline is the deliberate exception: it is passed
+    down unchanged from process start, because its whole value is
+    being older than the work it judges.
+    """
+
+    runtime = read_runtime()
+
+    phase_before = runtime.get("phase")
+
+    completed_cycles = 0
+    last_summary = None
+
+    for _ in range(max_cycles):
+        check_can_continue(runtime)
+
+        outcome = run_cycle(
+            runtime,
+            timeout,
+            baseline,
+        )
+
+        completed_cycles += 1
+        last_summary = outcome.get("summary")
+
+        runtime = read_runtime()
+
+    return {
+        "result": "OK",
+        "exit_code": EXIT_OK,
+        "detail": (
+            f"Completed {completed_cycles} cycle(s); the cycle "
+            "budget was reached with work still available."
+        ),
+        "phase_before": phase_before,
+        "runtime": runtime,
+        "cycles": completed_cycles,
+        "worker_summary": last_summary,
+    }
+
+
+# ================================================================
+# OUTPUT
+# ================================================================
+
+
+def emit(payload, exit_code):
+    print(
+        RESULT_LINE_PREFIX
+        + json.dumps(
+            payload,
+            sort_keys=True,
+        )
+    )
+
+    return exit_code
+
+
+def payload_from_runtime(runtime, phase_before):
+    return {
+        "task": runtime.get("task_id"),
+        "task_kind": runtime.get("task_kind"),
+        "state": runtime.get("state"),
+        "phase_before": phase_before,
+        "phase_after": runtime.get("phase"),
+    }
+
+
+# ================================================================
+# COMMANDS
+# ================================================================
+
+
+def cmd_run(args):
+    timeout = positive_float(
+        "AUTOPILOT_TIMEOUT",
+        DEFAULT_WORKER_TIMEOUT_SECONDS,
+    )
+
+    # Taken before any work begins, so it describes the worktree
+    # autopilot inherited rather than the one it produced.
+    baseline = untracked_entries()
+
+    runtime = read_runtime()
+
+    phase_before = runtime.get("phase")
+
+    try:
+        finished = drive(
+            args.max_cycles,
+            timeout,
+            baseline,
+        )
+
+    except Stop as stop:
+        runtime = read_runtime()
+
+        payload = payload_from_runtime(
+            runtime,
+            phase_before,
+        )
+
+        payload.update(
+            {
+                "result": stop.result,
+                "exit_code": stop.exit_code,
+                "detail": stop.detail,
+            }
+        )
+
+        payload.update(stop.extra)
+
+        return emit(
+            payload,
+            stop.exit_code,
+        )
+
+    payload = payload_from_runtime(
+        finished["runtime"],
+        finished["phase_before"],
+    )
+
+    payload.update(
+        {
+            "result": finished["result"],
+            "exit_code": finished["exit_code"],
+            "detail": finished["detail"],
+            "cycles": finished["cycles"],
+            "worker_summary": finished["worker_summary"],
+        }
+    )
+
+    return emit(
+        payload,
+        finished["exit_code"],
+    )
+
+
+def cmd_status(_):
+    """
+    Report what autopilot would do next, changing nothing.
+    """
+
+    runtime = read_runtime()
+
+    payload = payload_from_runtime(
+        runtime,
+        runtime.get("phase"),
+    )
+
+    payload.update(
+        {
+            "result": "OK",
+            "exit_code": EXIT_OK,
+            "human_gate": runtime.get("human_gate"),
+            "tests": runtime.get("tests"),
+            "report": runtime.get("report"),
+        }
+    )
+
+    try:
+        check_can_continue(runtime)
+
+    except Stop as stop:
+        payload["detail"] = stop.detail
+        payload["next_action"] = stop.result
+
+    else:
+        payload["detail"] = (
+            "Autopilot would run phase "
+            f"{runtime.get('phase')}."
+        )
+
+        payload["next_action"] = "RUN"
+
+    return emit(
+        payload,
+        EXIT_OK,
+    )
+
+
+def main():
+    # A worker session is deliberately unable to change lifecycle
+    # state. Letting it drive an autopilot run would hand back
+    # everything that restriction takes away, so the marker refuses
+    # the process outright rather than any particular subcommand.
+    if os.environ.get(WORKER_SESSION_MARKER):
+        raise SystemExit(
+            emit(
+                {
+                    "result": "REFUSED",
+                    "exit_code": EXIT_BLOCKED_PERMISSION,
+                    "detail": (
+                        "Refusing to run inside an autopilot worker "
+                        "session. A worker reports its outcome; it "
+                        "does not orchestrate."
+                    ),
+                },
+                EXIT_BLOCKED_PERMISSION,
+            )
+        )
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "CryptoLab unattended autopilot: deterministic "
+            "orchestrator for the statusctl lifecycle."
+        )
+    )
+
+    sub = parser.add_subparsers(
+        dest="cmd",
+        required=True,
+    )
+
+    for name in (
+        "run",
+        "resume",
+    ):
+        command = sub.add_parser(name)
+
+        command.add_argument(
+            "--max-cycles",
+            type=int,
+            default=DEFAULT_MAX_CYCLES,
+        )
+
+        command.set_defaults(func=cmd_run)
+
+    command = sub.add_parser("status")
+    command.set_defaults(func=cmd_status)
+
+    args = parser.parse_args()
+
+    if getattr(args, "max_cycles", 1) < 1:
+        raise SystemExit(
+            "--max-cycles must be at least 1."
+        )
+
+    try:
+        # `status` is read-only and deliberately lock-free, so
+        # inspecting a running worktree never contends with the run
+        # it inspects.
+        if args.func is cmd_status:
+            raise SystemExit(
+                args.func(args)
+            )
+
+        with autopilot_lock(ROOT):
+            raise SystemExit(
+                args.func(args)
+            )
+
+    except ConcurrentRun as error:
+        raise SystemExit(
+            emit(
+                {
+                    "result": "CONCURRENT",
+                    "exit_code": EXIT_CONCURRENT,
+                    "detail": str(error),
+                },
+                EXIT_CONCURRENT,
+            )
+        )
+
+    except ForbiddenCommand as error:
+        raise SystemExit(
+            emit(
+                {
+                    "result": "REFUSED",
+                    "exit_code": EXIT_BLOCKED_PERMISSION,
+                    "detail": str(error),
+                },
+                EXIT_BLOCKED_PERMISSION,
+            )
+        )
+
+    except Stop as stop:
+        payload = {
+            "result": stop.result,
+            "exit_code": stop.exit_code,
+            "detail": stop.detail,
+        }
+
+        payload.update(stop.extra)
+
+        raise SystemExit(
+            emit(
+                payload,
+                stop.exit_code,
+            )
+        )
+
+
+if __name__ == "__main__":
+    main()
