@@ -26,12 +26,15 @@
       "Bash(./.claude/bin/statusctl test *)",
       "Bash(./.claude/bin/statusctl test-not-required *)",
       "Bash(./.claude/bin/statusctl gate open *)",
+      "Bash(./.claude/bin/statusctl integration performed *)",
       "Bash(./.claude/bin/statusctl ready)",
       "Bash(./.claude/bin/statusctl fail *)"
     ],
 
     "ask": [
       "Bash(./.claude/bin/statusctl migrate-v3 *)",
+      "Bash(./.claude/bin/statusctl migrate-v31)",
+      "Bash(./.claude/bin/statusctl migrate-v31 *)",
 
       "Bash(git commit *)",
       "Bash(git push *)",

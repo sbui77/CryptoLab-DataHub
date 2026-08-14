@@ -32,7 +32,11 @@ LOCK_PATH = (
     / f"cryptolab-statusctl-{LOCK_KEY}.lock"
 )
 
-SCHEMA_VERSION = "3.0"
+SCHEMA_VERSION = "3.1"
+
+# Schema 3.0 carried the task model but no record of which git actions
+# an Integration Task intended to perform.
+V30_SCHEMA_VERSION = "3.0"
 
 LEGACY_SCHEMA_VERSION = "2.0"
 
@@ -61,9 +65,12 @@ WORK_PHASES = {
 
 # An Integration Task integrates an already reviewed Work Task. It
 # never implements and never re-tests product code, so its lifecycle
-# is deliberately narrow.
+# is deliberately narrow. INTEGRATE is where the declared git actions
+# are gated and performed, so that a commit or a push is not recorded
+# as having happened during ANALYZE.
 INTEGRATION_PHASES = {
     "ANALYZE",
+    "INTEGRATE",
     "FINAL_VERIFY",
 }
 
@@ -78,6 +85,80 @@ VALID_PHASES = WORK_PHASES | INTEGRATION_PHASES
 LEGACY_PHASES = WORK_PHASES - {
     "EXTERNAL_REVIEW",
     "CORRECT_EXTERNAL_FINDINGS",
+}
+
+# Schema 3.0 predates the INTEGRATE phase.
+V30_PHASES = VALID_PHASES - {
+    "INTEGRATE",
+}
+
+
+# ================================================================
+# INTEGRATION ACTION MODEL
+# ================================================================
+#
+# An Integration Task crosses git boundaries, and each boundary is a
+# separate human decision: approval to commit is not approval to push,
+# and approval to push is not approval to merge.
+#
+# Before schema 3.1 that separation existed only in the prose of a
+# gate. GIT_INTEGRATION was one undifferentiated type, and the runtime
+# kept a single last_gate_decision, so nothing on disk distinguished
+# an authorized commit from an unauthorized push. `ready` therefore
+# had nothing to check, and because a gate can only be opened while
+# RUNNING, a task could complete with an intended push unauthorized
+# and no lawful way left to authorize it.
+#
+# So the intended scope is declared when the Integration Task starts,
+# and every declared action carries its own status:
+#
+#     DECLARED    intended, not yet decided by a human
+#     AUTHORIZED  a human approved a gate naming exactly this action
+#     PERFORMED   the action was carried out, with observed evidence
+#     DECLINED    a human rejected it; explicitly not in scope
+#
+# Completion requires every declared action to be PERFORMED or
+# DECLINED. The gap is closed at the front of the lifecycle rather
+# than by allowing a gate after completion, because a task that can be
+# reopened is a task whose READY_FOR_HUMAN_REVIEW means nothing.
+
+INTEGRATION_ACTIONS = (
+    "commit",
+    "push",
+    "merge",
+)
+
+# Declaring no scope at all is a claim in its own right, so it is
+# sayable rather than merely implied by silence.
+NO_INTEGRATION_ACTION = "none"
+
+ACTION_DECLARED = "DECLARED"
+ACTION_AUTHORIZED = "AUTHORIZED"
+ACTION_PERFORMED = "PERFORMED"
+ACTION_DECLINED = "DECLINED"
+
+VALID_ACTION_STATUSES = {
+    ACTION_DECLARED,
+    ACTION_AUTHORIZED,
+    ACTION_PERFORMED,
+    ACTION_DECLINED,
+}
+
+# The two statuses that end an action's life. Everything else leaves a
+# decision outstanding and must block completion.
+RESOLVED_ACTION_STATUSES = {
+    ACTION_PERFORMED,
+    ACTION_DECLINED,
+}
+
+INTEGRATION_ACTION_KEYS = {
+    "action",
+    "status",
+    "gate_id",
+    "decided_at",
+    "record",
+    "authorized_head",
+    "evidence",
 }
 
 # An integration boundary belongs to an Integration Task, so these
@@ -122,11 +203,17 @@ TOP_LEVEL_KEYS = {
     "schema_version", "project", "state", "task_id", "task_title",
     "task_kind", "parent_task_id",
     "phase", "branch", "started_at", "updated_at", "completed_at",
-    "tests", "human_gate", "last_gate_decision", "report",
+    "tests", "human_gate", "last_gate_decision",
+    "integration_actions", "report",
 }
 
-# Schema 2.0 carried no task model.
-LEGACY_TOP_LEVEL_KEYS = TOP_LEVEL_KEYS - {
+# Schema 3.0 carried no declared integration scope.
+V30_TOP_LEVEL_KEYS = TOP_LEVEL_KEYS - {
+    "integration_actions",
+}
+
+# Schema 2.0 carried no task model either.
+LEGACY_TOP_LEVEL_KEYS = V30_TOP_LEVEL_KEYS - {
     "task_kind",
     "parent_task_id",
 }
@@ -138,6 +225,19 @@ MIGRATION_HINT = (
     "    ./.claude/bin/statusctl migrate-v3 WORK\n"
     "    ./.claude/bin/statusctl migrate-v3 INTEGRATION "
     "PARENT_TASK_ID\n"
+    "Normal commands never upgrade runtime state implicitly."
+)
+
+V31_MIGRATION_HINT = (
+    "Runtime status uses schema "
+    f"{V30_SCHEMA_VERSION}, but this controller requires schema "
+    f"{SCHEMA_VERSION}, which records the git actions an Integration "
+    "Task is authorized to perform. Run an explicit migration "
+    "first:\n"
+    "    ./.claude/bin/statusctl migrate-v31\n"
+    "    ./.claude/bin/statusctl migrate-v31 --action push\n"
+    "An Integration Task in flight should declare the actions still "
+    "in its scope, so the migration cannot quietly narrow it.\n"
     "Normal commands never upgrade runtime state implicitly."
 )
 
@@ -278,17 +378,40 @@ def validate_test_result(result, label):
         )
 
 
-def validate_human_gate(gate):
+def validate_human_gate(gate, *, gate_action):
     if gate is None:
         return
+
+    keys = {
+        "gate_id", "type", "question", "recommendation",
+        "alternatives", "risks", "opened_at",
+    }
+
+    if gate_action:
+        keys.add("action")
+
     require_exact_keys(
         gate,
-        {
-            "gate_id", "type", "question", "recommendation",
-            "alternatives", "risks", "opened_at",
-        },
+        keys,
         "human_gate",
     )
+
+    if gate_action:
+        action = gate["action"]
+
+        if action is not None:
+            if action not in INTEGRATION_ACTIONS:
+                validation_error(
+                    f"human_gate.action is invalid: {action}"
+                )
+
+            # An action names a git boundary, so it is meaningless on
+            # any other kind of decision.
+            if gate["type"] not in INTEGRATION_ONLY_GATE_TYPES:
+                validation_error(
+                    "human_gate.action is only valid for gate types "
+                    f"{', '.join(sorted(INTEGRATION_ONLY_GATE_TYPES))}."
+                )
     require_gate_id(gate["gate_id"], "human_gate.gate_id")
     if gate["type"] not in VALID_GATE_TYPES:
         validation_error(f"human_gate.type is invalid: {gate['type']}")
@@ -319,6 +442,132 @@ def validate_gate_decision(decision):
         decision["resolved_at"], "last_gate_decision.resolved_at"
     )
     require_non_empty_string(decision["record"], "last_gate_decision.record")
+
+
+def validate_integration_actions(data):
+    """
+    Enforce the declared-scope contract.
+
+    The field is the integration identity's alone: a Work Task that
+    carried declared git actions would be integrating, which is the
+    separation Semantics A exists to keep.
+    """
+
+    declared = data["integration_actions"]
+
+    if data["task_kind"] != TASK_KIND_INTEGRATION:
+        if declared is not None:
+            validation_error(
+                "integration_actions is only valid for an "
+                "INTEGRATION task."
+            )
+        return
+
+    if not isinstance(declared, list):
+        validation_error(
+            "INTEGRATION requires integration_actions to be an "
+            "array."
+        )
+
+    seen = []
+
+    for index, entry in enumerate(declared):
+        label = f"integration_actions[{index}]"
+
+        require_exact_keys(
+            entry,
+            INTEGRATION_ACTION_KEYS,
+            label,
+        )
+
+        action = entry["action"]
+
+        if action not in INTEGRATION_ACTIONS:
+            validation_error(
+                f"{label}.action is invalid: {action}"
+            )
+
+        if action in seen:
+            validation_error(
+                f"{label}.action is declared more than once: "
+                f"{action}"
+            )
+
+        seen.append(action)
+
+        status = entry["status"]
+
+        if status not in VALID_ACTION_STATUSES:
+            validation_error(
+                f"{label}.status is invalid: {status}"
+            )
+
+        require_nullable_string(
+            entry["record"], f"{label}.record"
+        )
+        require_nullable_string(
+            entry["authorized_head"], f"{label}.authorized_head"
+        )
+        require_nullable_string(
+            entry["evidence"], f"{label}.evidence"
+        )
+
+        if entry["gate_id"] is not None:
+            require_gate_id(
+                entry["gate_id"], f"{label}.gate_id"
+            )
+
+        if entry["decided_at"] is not None:
+            require_timestamp(
+                entry["decided_at"], f"{label}.decided_at"
+            )
+
+        # A status that came from a human decision must carry the
+        # gate that produced it. Otherwise an action could present
+        # itself as authorized with nothing behind the claim.
+        if status in {
+            ACTION_AUTHORIZED,
+            ACTION_PERFORMED,
+            ACTION_DECLINED,
+        }:
+            if entry["gate_id"] is None:
+                validation_error(
+                    f"{label}.status={status} requires the gate_id "
+                    "of the decision that produced it."
+                )
+
+            if entry["decided_at"] is None:
+                validation_error(
+                    f"{label}.status={status} requires decided_at."
+                )
+
+        if status == ACTION_PERFORMED and not entry["evidence"]:
+            validation_error(
+                f"{label}.status={ACTION_PERFORMED} requires "
+                "evidence that the action was carried out."
+            )
+
+    if seen != [
+        action
+        for action in INTEGRATION_ACTIONS
+        if action in seen
+    ]:
+        validation_error(
+            "integration_actions must be recorded in canonical "
+            f"order: {', '.join(INTEGRATION_ACTIONS)}."
+        )
+
+
+def unresolved_actions(data):
+    """
+    Declared actions still awaiting a human decision or their doing.
+    """
+
+    return [
+        entry["action"]
+        for entry in (data.get("integration_actions") or [])
+        if entry["status"] not in RESOLVED_ACTION_STATUSES
+    ]
 
 
 def same_task_identity(left, right):
@@ -439,14 +688,25 @@ def validate_state_shape(
     require_timestamp(data["updated_at"], "updated_at", nullable=True)
     require_timestamp(data["completed_at"], "completed_at", nullable=True)
 
+    # Declared integration scope arrived with schema 3.1, so the
+    # contract being validated is what decides whether the field and
+    # the gate's action binding exist at all.
+    scoped = "integration_actions" in top_level_keys
+
     require_exact_keys(data["tests"], {"targeted", "full"}, "tests")
     validate_test_result(data["tests"]["targeted"], "tests.targeted")
     validate_test_result(data["tests"]["full"], "tests.full")
-    validate_human_gate(data["human_gate"])
+    validate_human_gate(
+        data["human_gate"],
+        gate_action=scoped,
+    )
     validate_gate_decision(data["last_gate_decision"])
 
     if task_model:
         validate_task_model(data)
+
+        if scoped:
+            validate_integration_actions(data)
 
     state = data["state"]
     if state == "IDLE":
@@ -499,17 +759,29 @@ def validate_state_shape(
                 "READY_FOR_HUMAN_REVIEW requires full test PASS "
                 "or justified NOT_REQUIRED."
             )
+        # Completion means the Integration Task itself is finished, so
+        # every git boundary it declared must have been performed or
+        # explicitly declined. Enforcing it here rather than only in
+        # `ready` means a hand-written completion cannot smuggle an
+        # unresolved action past the load path either.
+        outstanding = unresolved_actions(data)
+        if outstanding:
+            validation_error(
+                "READY_FOR_HUMAN_REVIEW requires every declared "
+                "integration action to be PERFORMED or DECLINED; "
+                f"unresolved: {', '.join(outstanding)}."
+            )
     elif state == "FAILED":
         require_timestamp(data["completed_at"], "completed_at")
 
 
 def validate_runtime_state(data):
     """
-    Canonical schema-3.0 validator.
+    Canonical schema-3.1 validator.
 
-    This validator accepts schema 3.0 only. Legacy schema-2.0 state is
-    not silently normalized here: it must pass through the explicit
-    migrate-v3 path.
+    This validator accepts schema 3.1 only. Superseded state is not
+    silently normalized here: schema 3.0 must pass through the
+    explicit migrate-v31 path, and schema 2.0 through migrate-v3.
     """
 
     validate_state_shape(
@@ -517,6 +789,24 @@ def validate_runtime_state(data):
         schema_version=SCHEMA_VERSION,
         top_level_keys=TOP_LEVEL_KEYS,
         phases=VALID_PHASES,
+        task_model=True,
+    )
+
+
+def validate_v30_runtime_state(data):
+    """
+    Validate a schema-3.0 state before it may be migrated to 3.1.
+
+    Migration transforms runtime state, so the input must be a valid
+    v3.0 state rather than merely a JSON object carrying the right
+    version string.
+    """
+
+    validate_state_shape(
+        data,
+        schema_version=V30_SCHEMA_VERSION,
+        top_level_keys=V30_TOP_LEVEL_KEYS,
+        phases=V30_PHASES,
         task_model=True,
     )
 
@@ -549,6 +839,43 @@ def git_output(args):
         ).strip()
     except Exception:
         return ""
+
+
+def git_succeeds(args):
+    """
+    Whether a read-only git query exits zero.
+
+    Evidence checks need the exit status rather than the output: "is
+    HEAD an ancestor of the upstream" is answered by the status alone.
+    """
+
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode == 0
+    except Exception:
+        return False
+
+
+def head_sha():
+    return git_output(["rev-parse", "HEAD"])
+
+
+def upstream_ref():
+    value = git_output(
+        [
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{u}",
+        ]
+    )
+
+    return value or None
 
 
 def branch():
@@ -586,6 +913,7 @@ def idle_state():
         },
         "human_gate": None,
         "last_gate_decision": None,
+        "integration_actions": None,
         "report": REPORT,
     }
 
@@ -634,6 +962,9 @@ def load():
     if data.get("schema_version") == LEGACY_SCHEMA_VERSION:
         raise SystemExit(MIGRATION_HINT)
 
+    if data.get("schema_version") == V30_SCHEMA_VERSION:
+        raise SystemExit(V31_MIGRATION_HINT)
+
     validate_runtime_state(data)
     return data
 
@@ -664,14 +995,58 @@ def load_legacy_state():
             f"{SCHEMA_VERSION}; nothing to migrate."
         )
 
+    if version == V30_SCHEMA_VERSION:
+        raise SystemExit(V31_MIGRATION_HINT)
+
     if version != LEGACY_SCHEMA_VERSION:
         raise SystemExit(
             "Cannot migrate unsupported schema_version: "
             f"{version!r}. Only schema {LEGACY_SCHEMA_VERSION} can "
-            f"be migrated to schema {SCHEMA_VERSION}."
+            f"be migrated by migrate-v3."
         )
 
     validate_legacy_runtime_state(data)
+
+    return data
+
+
+def load_v30_state():
+    """
+    Dedicated raw schema-3.0 read path used only by migrate-v31.
+
+    Like the legacy path, this never calls load(): the canonical load
+    refuses schema 3.0 by design, so the migration must read and
+    validate the superseded document itself.
+    """
+
+    if not STATUS.exists():
+        raise SystemExit(
+            "No runtime status to migrate: "
+            f"{STATUS} does not exist. A fresh runtime is already "
+            f"schema {SCHEMA_VERSION}."
+        )
+
+    data = read_status_document()
+
+    version = data.get("schema_version")
+
+    if version == SCHEMA_VERSION:
+        raise SystemExit(
+            "Runtime status is already schema "
+            f"{SCHEMA_VERSION}; nothing to migrate."
+        )
+
+    if version == LEGACY_SCHEMA_VERSION:
+        raise SystemExit(MIGRATION_HINT)
+
+    if version != V30_SCHEMA_VERSION:
+        raise SystemExit(
+            "Cannot migrate unsupported schema_version: "
+            f"{version!r}. Only schema {V30_SCHEMA_VERSION} can be "
+            f"migrated to schema {SCHEMA_VERSION}."
+        )
+
+    validate_v30_runtime_state(data)
 
     return data
 
@@ -801,6 +1176,8 @@ def render_report(data):
             "- **Status:** OPEN",
             f"- **Gate ID:** {gate.get('gate_id', 'UNKNOWN')}",
             f"- **Type:** {gate.get('type', 'UNKNOWN')}",
+            f"- **Authorizes action:** "
+            f"{gate.get('action') or 'NONE'}",
             f"- **Opened:** {gate.get('opened_at', 'UNKNOWN')}",
             f"- **Question:** {gate.get('question', '')}",
             f"- **Recommendation:** {gate.get('recommendation', '')}",
@@ -833,6 +1210,52 @@ def render_report(data):
 
     else:
         lines.append("- **Status:** NONE OPEN")
+
+    lines.extend([
+        "",
+        "## Declared Integration Scope",
+        "",
+    ])
+
+    declared = data.get("integration_actions")
+
+    if declared is None:
+        lines.append(
+            "- Not an Integration Task; no git action is in scope."
+        )
+    elif not declared:
+        lines.append(
+            "- Declared empty: this Integration Task claims no git "
+            "action."
+        )
+    else:
+        for entry in declared:
+            detail = (
+                entry.get("evidence")
+                or entry.get("record")
+                or "awaiting a human decision"
+            )
+
+            lines.append(
+                f"- **{entry.get('action')}:** "
+                f"{entry.get('status')} "
+                f"({entry.get('gate_id') or 'no gate yet'}) — "
+                f"{detail}"
+            )
+
+        outstanding = unresolved_actions(data)
+
+        lines.extend([
+            "",
+            (
+                "- **Unresolved:** "
+                + ", ".join(outstanding)
+                + ". Completion is blocked until each is "
+                "performed or declined."
+                if outstanding
+                else "- **Unresolved:** none."
+            ),
+        ])
 
     lines.extend([
         "",
@@ -1011,10 +1434,136 @@ def test_is_ready(result):
     return False
 
 
+def declare_actions(actions, task_kind):
+    """
+    Build the declared-scope record for a new Integration Task.
+
+    Duplicates collapse and the result is stored in canonical order,
+    so scope is a set of boundaries rather than a sequence of
+    requests, and two tasks declaring the same scope record it
+    identically.
+    """
+
+    if task_kind != TASK_KIND_INTEGRATION:
+        if actions:
+            raise SystemExit(
+                "Only an Integration Task may declare git "
+                "integration actions."
+            )
+
+        return None
+
+    requested = list(actions or [])
+
+    # An explicit "none" states that no git boundary belongs to this
+    # Integration Task. It exists so that an empty scope can be
+    # deliberate rather than accidental, and it cannot be combined
+    # with a real action.
+    if NO_INTEGRATION_ACTION in requested:
+        if len(set(requested)) > 1:
+            raise SystemExit(
+                f"--action {NO_INTEGRATION_ACTION} declares that no "
+                "git action is in scope, so it cannot be combined "
+                "with another action."
+            )
+
+        return []
+
+    for action in requested:
+        if action not in INTEGRATION_ACTIONS:
+            raise SystemExit(
+                f"Unsupported integration action: {action}. "
+                "Supported actions are "
+                f"{', '.join(INTEGRATION_ACTIONS)}, or "
+                f"{NO_INTEGRATION_ACTION} to declare that none "
+                "apply."
+            )
+
+    return [
+        {
+            "action": action,
+            "status": ACTION_DECLARED,
+            "gate_id": None,
+            "decided_at": None,
+            "record": None,
+            "authorized_head": None,
+            "evidence": None,
+        }
+        for action in INTEGRATION_ACTIONS
+        if action in requested
+    ]
+
+
+INTEGRATE_PHASE = "INTEGRATE"
+
+
+def require_integrate_phase(data, what):
+    """
+    Integration actions belong to the INTEGRATE phase.
+
+    The phase is the runtime's statement that the task is standing at
+    its integration boundary. A commit gated during ANALYZE is a
+    commit recorded as analysis, and one gated during FINAL_VERIFY is
+    an action taken after the verification that was supposed to cover
+    it.
+    """
+
+    if data["phase"] != INTEGRATE_PHASE:
+        raise SystemExit(
+            f"Cannot {what} while phase={data['phase']}. "
+            f"Integration actions are gated and performed in "
+            f"{INTEGRATE_PHASE}:\n"
+            f"    ./.claude/bin/statusctl phase {INTEGRATE_PHASE}"
+        )
+
+
+def find_action(data, action):
+    for entry in data.get("integration_actions") or []:
+        if entry["action"] == action:
+            return entry
+
+    return None
+
+
+def require_declared_action(data, action):
+    """
+    Resolve a declared action, refusing anything outside the scope.
+
+    An action the task never declared is not merely unauthorized: it
+    was never part of this integration, and admitting it here would
+    let scope grow silently at the moment of use.
+    """
+
+    if data["task_kind"] != TASK_KIND_INTEGRATION:
+        raise SystemExit(
+            "Integration actions belong to an Integration Task, but "
+            f"the current task_kind is {data['task_kind']}. Start an "
+            "Integration Task with start-integration first."
+        )
+
+    entry = find_action(data, action)
+
+    if entry is None:
+        declared = [
+            item["action"]
+            for item in data["integration_actions"] or []
+        ]
+
+        raise SystemExit(
+            f"Integration action {action} is not declared by this "
+            "Integration Task. Declared actions are "
+            f"{', '.join(declared) or 'none'}. Scope is declared at "
+            "start-integration and cannot be widened afterwards."
+        )
+
+    return entry
+
+
 def migrate_state_to_v3(
     legacy,
     task_kind,
     parent_task_id,
+    declared_actions,
 ):
     """
     Transform a validated schema-2.0 state into schema 3.0.
@@ -1045,9 +1594,30 @@ def migrate_state_to_v3(
         "updated_at": legacy["updated_at"],
         "completed_at": legacy["completed_at"],
         "tests": legacy["tests"],
-        "human_gate": legacy["human_gate"],
+        "human_gate": with_gate_action(legacy["human_gate"]),
         "last_gate_decision": legacy["last_gate_decision"],
+        "integration_actions": declared_actions,
         "report": legacy["report"],
+    }
+
+
+def with_gate_action(gate):
+    """
+    Carry an older gate forward without inventing an authorization.
+
+    A gate recorded before action binding existed names no action, and
+    it must not acquire one here: the migration would then be
+    manufacturing the very approval the binding exists to demand. It
+    stays actionless, which resolves nothing and leaves every declared
+    action outstanding.
+    """
+
+    if gate is None:
+        return None
+
+    return {
+        **gate,
+        "action": None,
     }
 
 
@@ -1133,10 +1703,32 @@ def cmd_migrate_v3(args):
             f"{', '.join(sorted(INTEGRATION_PHASES))}."
         )
 
+    declared_actions = declare_actions(
+        args.action,
+        task_kind,
+    )
+
+    # The same rule as migrate-v31, for the same reason: a migration
+    # that invented an empty scope would be claiming, on the
+    # operator's behalf, that no git boundary remains.
+    if (
+        task_kind == TASK_KIND_INTEGRATION
+        and not args.action
+    ):
+        raise SystemExit(
+            "Migrating to an Integration Task requires its "
+            "integration scope to be declared explicitly:\n"
+            "    ./.claude/bin/statusctl migrate-v3 INTEGRATION "
+            "PARENT_TASK_ID --action push\n"
+            "If no git action remains in scope, declare that "
+            "deliberately with --action none."
+        )
+
     migrated = migrate_state_to_v3(
         legacy,
         task_kind,
         parent_task_id,
+        declared_actions,
     )
 
     # save() validates the candidate before atomically replacing
@@ -1152,6 +1744,95 @@ def cmd_migrate_v3(args):
         parent_task_id=migrated["parent_task_id"],
         state=migrated["state"],
         phase=migrated["phase"],
+    )
+
+    print(
+        f"Migrated runtime status to schema {SCHEMA_VERSION} "
+        f"(task_kind={migrated['task_kind']})."
+    )
+
+
+def migrate_state_to_v31(v30, declared_actions):
+    """
+    Transform a validated schema-3.0 state into schema 3.1.
+
+    Every 3.0 runtime field is preserved. Only the declared
+    integration scope and the gate's action binding are introduced.
+    """
+
+    return {
+        **v30,
+        "schema_version": SCHEMA_VERSION,
+        "human_gate": with_gate_action(v30["human_gate"]),
+        "integration_actions": declared_actions,
+    }
+
+
+def cmd_migrate_v31(args):
+    """
+    Explicit, operator-driven schema-3.0 to schema-3.1 migration.
+
+    Fail-closed in the same order as migrate-v3: raw read, validate
+    the input contract, deterministic transform, validate the result,
+    atomic replacement, audit event. A rejected migration leaves
+    status.json byte-identical and appends no success event.
+
+    An Integration Task in flight declares the actions still in its
+    scope. The migration will not invent an empty scope for it,
+    because an empty scope is a claim that no git boundary remains —
+    exactly the silent narrowing this schema exists to prevent.
+    """
+
+    v30 = load_v30_state()
+
+    if v30["state"] == "IDLE":
+        raise SystemExit(
+            "Runtime status is IDLE, so there is no task to "
+            f"migrate. A fresh runtime is already schema "
+            f"{SCHEMA_VERSION}: remove the superseded status file, "
+            "or start a task instead of migrating."
+        )
+
+    declared_actions = declare_actions(
+        args.action,
+        v30["task_kind"],
+    )
+
+    if (
+        v30["task_kind"] == TASK_KIND_INTEGRATION
+        and not args.action
+    ):
+        raise SystemExit(
+            "Migrating an Integration Task requires its remaining "
+            "integration scope to be declared explicitly:\n"
+            "    ./.claude/bin/statusctl migrate-v31 --action push\n"
+            "Declare every git action this Integration Task still "
+            "intends to perform. If none remain, declare that "
+            "deliberately with --action none."
+        )
+
+    migrated = migrate_state_to_v31(
+        v30,
+        declared_actions,
+    )
+
+    # save() validates the candidate before atomically replacing
+    # canonical status.json, so an invalid transform cannot reach disk.
+    save(migrated)
+
+    audit(
+        "RUNTIME_SCHEMA_MIGRATED",
+        task_id=migrated["task_id"],
+        from_schema=V30_SCHEMA_VERSION,
+        to_schema=SCHEMA_VERSION,
+        task_kind=migrated["task_kind"],
+        parent_task_id=migrated["parent_task_id"],
+        state=migrated["state"],
+        phase=migrated["phase"],
+        declared_actions=[
+            entry["action"]
+            for entry in (migrated["integration_actions"] or [])
+        ],
     )
 
     print(
@@ -1207,6 +1888,7 @@ def cmd_start(args):
         },
         "human_gate": None,
         "last_gate_decision": None,
+        "integration_actions": None,
         "report": REPORT,
     })
 
@@ -1269,6 +1951,31 @@ def cmd_start_integration(args):
             "Integration Task its own identity."
         )
 
+    # Scope is declared before any integration work begins, so the
+    # human who approves the first boundary can already see every
+    # boundary the task intends to cross.
+    #
+    # Omitting it is refused rather than read as "nothing": an absent
+    # scope is exactly the accident this field exists to prevent, and
+    # silence is not a declaration. An Integration Task that really
+    # crosses no git boundary says so.
+    if not args.action:
+        raise SystemExit(
+            "An Integration Task must declare its git scope "
+            "explicitly:\n"
+            "    ./.claude/bin/statusctl start-integration TASK_ID "
+            "TITLE --action commit --action push\n"
+            "If no git action belongs to this task, declare that "
+            "deliberately:\n"
+            "    ./.claude/bin/statusctl start-integration TASK_ID "
+            f"TITLE --action {NO_INTEGRATION_ACTION}"
+        )
+
+    declared_actions = declare_actions(
+        args.action,
+        TASK_KIND_INTEGRATION,
+    )
+
     timestamp = now()
 
     data.update({
@@ -1289,6 +1996,7 @@ def cmd_start_integration(args):
         },
         "human_gate": None,
         "last_gate_decision": None,
+        "integration_actions": declared_actions,
         "report": REPORT,
     })
 
@@ -1301,6 +2009,10 @@ def cmd_start_integration(args):
         task_kind=TASK_KIND_INTEGRATION,
         parent_task_id=parent_task_id,
         branch=data["branch"],
+        declared_actions=[
+            entry["action"]
+            for entry in declared_actions
+        ],
     )
 
 
@@ -1432,6 +2144,44 @@ def cmd_gate_open(args):
             "requesting an integration decision."
         )
 
+    action = args.action
+
+    if action is not None and args.type not in INTEGRATION_ONLY_GATE_TYPES:
+        raise SystemExit(
+            f"--action is only meaningful for gate types "
+            f"{', '.join(sorted(INTEGRATION_ONLY_GATE_TYPES))}, not "
+            f"{args.type}."
+        )
+
+    if args.type in INTEGRATION_ONLY_GATE_TYPES:
+        require_integrate_phase(
+            data,
+            f"open a {args.type} gate",
+        )
+
+        # An integration gate that names no action is the ambiguity
+        # this schema exists to remove: approving it would authorize
+        # nothing in particular, and everything by implication.
+        if action is None:
+            raise SystemExit(
+                "A GIT_INTEGRATION gate must name exactly one "
+                "declared action:\n"
+                "    ./.claude/bin/statusctl gate open "
+                "GIT_INTEGRATION --action push QUESTION "
+                "RECOMMENDATION\n"
+                "Approval to commit is not approval to push."
+            )
+
+        entry = require_declared_action(data, action)
+
+        if entry["status"] != ACTION_DECLARED:
+            raise SystemExit(
+                f"Integration action {action} is already "
+                f"{entry['status']}. A resolved or authorized action "
+                "is not re-decided; open a gate only for an action "
+                "still awaiting a human decision."
+            )
+
     opened_at = now()
     gate_id = next_gate_id()
 
@@ -1443,6 +2193,7 @@ def cmd_gate_open(args):
         "alternatives": args.alternative or [],
         "risks": args.risk or [],
         "opened_at": opened_at,
+        "action": action,
     }
 
     data["state"] = "BLOCKED_HUMAN_DECISION"
@@ -1455,6 +2206,7 @@ def cmd_gate_open(args):
         task_id=data["task_id"],
         gate_id=gate_id,
         gate_type=gate["type"],
+        action=gate["action"],
         question=gate["question"],
         recommendation=gate["recommendation"],
         gate=gate,
@@ -1491,6 +2243,54 @@ def require_open_gate(
     return gate
 
 
+def apply_gate_decision_to_action(
+    data,
+    gate,
+    decision,
+    record,
+    resolved_at,
+):
+    """
+    Move the one action this gate was opened for, and no other.
+
+    APPROVED authorizes exactly the named boundary. REJECTED declines
+    it, which is the explicit record that it is not part of this
+    Integration Task's approved scope. ALTERNATIVE deliberately moves
+    nothing: "do something else" is not an authorization, so the
+    action stays DECLARED and a human must still decide it.
+
+    The authorizing HEAD is captured here because it is the evidence
+    the performing step is checked against: an action cannot later
+    claim to have been carried out if the repository never moved.
+    """
+
+    action = gate.get("action")
+
+    if action is None:
+        return None
+
+    entry = find_action(data, action)
+
+    if entry is None:
+        return None
+
+    if decision == "APPROVED":
+        entry["status"] = ACTION_AUTHORIZED
+        entry["authorized_head"] = head_sha() or None
+
+    elif decision == "REJECTED":
+        entry["status"] = ACTION_DECLINED
+
+    else:
+        return None
+
+    entry["gate_id"] = gate["gate_id"]
+    entry["decided_at"] = resolved_at
+    entry["record"] = record
+
+    return entry
+
+
 def resolve_gate(
     data,
     gate,
@@ -1509,6 +2309,14 @@ def resolve_gate(
         "record": record,
     }
 
+    entry = apply_gate_decision_to_action(
+        data,
+        gate,
+        decision,
+        record,
+        resolved_at,
+    )
+
     save(data)
 
     audit(
@@ -1516,6 +2324,12 @@ def resolve_gate(
         task_id=data["task_id"],
         gate_id=gate["gate_id"],
         gate_type=gate["type"],
+        action=gate.get("action"),
+        action_status=(
+            entry["status"]
+            if entry
+            else None
+        ),
         decision=decision,
         decision_record=record,
         opened_at=gate["opened_at"],
@@ -1575,6 +2389,324 @@ def cmd_gate_reject(args):
     )
 
 
+# ================================================================
+# ACTION EVIDENCE
+# ================================================================
+#
+# Each action is verified by what only that action leaves behind.
+#
+# "HEAD moved" is not enough, because commit and merge both move it:
+# an ordinary commit would satisfy a merge authorization and a merge
+# would satisfy a commit authorization. So a commit must be an
+# ordinary single-parent commit, and a merge must be a real merge
+# commit with two or more parents.
+#
+# A fast-forward merge is deliberately not accepted. It leaves no
+# merge commit and no other trace, so nothing distinguishes it from
+# the branch simply having advanced — there is no evidence to check,
+# and inventing one would be the weakening this design exists to
+# avoid. `--no-ff` records the merge that was authorized.
+
+
+def head_parents():
+    """
+    The parent SHAs of HEAD, empty when there is no commit.
+    """
+
+    line = git_output(
+        [
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            "HEAD",
+        ]
+    )
+
+    parts = line.split()
+
+    return parts[1:] if parts else []
+
+
+def require_current_head(action):
+    current = head_sha()
+
+    if not current:
+        raise SystemExit(
+            f"Cannot record {action}: this worktree has no HEAD "
+            "commit, so there is nothing to verify the action "
+            "against."
+        )
+
+    return current
+
+
+def require_head_moved(entry, action, current):
+    """
+    Reject the case where nothing happened at all.
+
+    The parent rules below would also reject it, but with a message
+    about parentage rather than the plain fact that the repository is
+    exactly as the human left it.
+    """
+
+    if current == entry["authorized_head"]:
+        raise SystemExit(
+            f"Cannot record {action}: HEAD is still {current}, "
+            "unchanged since the action was authorized. Nothing was "
+            "recorded because nothing happened."
+        )
+
+
+def commit_evidence(entry, action):
+    """
+    Evidence of exactly one ordinary commit on the authorized state.
+
+    Descent is not enough. If a commit is authorized at A and then B
+    and C are made, C is still a single-parent commit descending from
+    A — so an ancestry test would accept two commits as evidence of
+    the one that was approved. What was authorized was a single
+    history transition, so the direct parent of HEAD must be the
+    authorized commit itself.
+
+    When nothing was authorized to build on, because the worktree had
+    no commit at all, the one legal transition is the root commit,
+    which has no parent.
+    """
+
+    current = require_current_head(action)
+
+    require_head_moved(
+        entry,
+        action,
+        current,
+    )
+
+    authorized = entry["authorized_head"]
+
+    parents = head_parents()
+
+    if len(parents) > 1:
+        raise SystemExit(
+            f"Cannot record {action}: HEAD {current} is a merge "
+            f"commit with {len(parents)} parents. A merge does not "
+            "satisfy a commit authorization; the two are separate "
+            "boundaries and each needs its own gate."
+        )
+
+    if not authorized:
+        if parents:
+            raise SystemExit(
+                f"Cannot record {action}: the worktree had no commit "
+                f"when the action was authorized, so the only legal "
+                f"transition is a root commit, but HEAD {current} "
+                f"has parent {parents[0]}."
+            )
+
+        return (
+            f"root commit {current}, made where the authorized state "
+            "had no commit."
+        )
+
+    if parents[0] != authorized:
+        raise SystemExit(
+            f"Cannot record {action}: HEAD {current} has parent "
+            f"{parents[0]}, not the authorized commit {authorized}. "
+            "One commit was authorized; the history here has moved "
+            "further than that, so what would be recorded is not "
+            "what was approved."
+        )
+
+    return (
+        f"commit {current} whose parent is the authorized commit "
+        f"{authorized}."
+    )
+
+
+def merge_evidence(entry, action):
+    """
+    Evidence of the authorized merge, not merely of some merge.
+
+    The same gap applies: an intervening commit before merging leaves
+    the authorized commit a distant ancestor of the merge, which
+    containment would accept. The authorized commit must be the merge
+    commit's FIRST parent.
+
+    First parent specifically, because an Integration Task merges
+    other work into the branch it is standing on: the branch's own
+    previous tip is the first parent, and that tip is what the human
+    authorized. Accepting the authorized commit in any parent
+    position would also accept merging the branch into something
+    else, which is a different action.
+    """
+
+    current = require_current_head(action)
+
+    require_head_moved(
+        entry,
+        action,
+        current,
+    )
+
+    authorized = entry["authorized_head"]
+
+    parents = head_parents()
+
+    if len(parents) < 2:
+        raise SystemExit(
+            f"Cannot record {action}: HEAD {current} has "
+            f"{len(parents)} parent(s), so it is an ordinary commit "
+            "rather than a merge. An ordinary commit does not "
+            "satisfy a merge authorization, and a fast-forward merge "
+            "leaves no evidence that a merge happened at all — merge "
+            "with --no-ff so the authorized merge is recorded in the "
+            "history."
+        )
+
+    if not authorized:
+        raise SystemExit(
+            f"Cannot record {action}: the worktree had no commit "
+            "when the action was authorized, so there is no branch "
+            "state the merge could have been made on."
+        )
+
+    if parents[0] != authorized:
+        raise SystemExit(
+            f"Cannot record {action}: the first parent of merge "
+            f"{current} is {parents[0]}, not the authorized commit "
+            f"{authorized}. The merge was not made on the branch "
+            "state that was approved."
+        )
+
+    return (
+        f"merge {current} with parents {', '.join(parents)}, made on "
+        f"the authorized commit {authorized}."
+    )
+
+
+def push_evidence(entry, action):
+    """
+    Evidence that the authorized commit itself was published.
+
+    Containment of the current HEAD is not sufficient. A push gate
+    authorizes publishing one exact commit, and "the branch is up to
+    date" is satisfied by any later commit from any source. So the
+    commit the human approved must still be HEAD, and that exact SHA
+    must be contained in the configured upstream.
+    """
+
+    upstream = upstream_ref()
+
+    if not upstream:
+        raise SystemExit(
+            f"Cannot record {action}: this branch has no upstream, "
+            "so there is no published ref to verify against. "
+            "Configure the upstream the push targeted."
+        )
+
+    current = require_current_head(action)
+
+    authorized = entry["authorized_head"]
+
+    if not authorized:
+        raise SystemExit(
+            f"Cannot record {action}: no commit was recorded when "
+            "the action was authorized, so there is nothing to "
+            "verify was published."
+        )
+
+    if current != authorized:
+        raise SystemExit(
+            f"Cannot record {action}: the authorized commit was "
+            f"{authorized}, but HEAD is now {current}. A push gate "
+            "authorizes publishing one exact commit; publishing a "
+            "different one is a different action and needs its own "
+            "decision."
+        )
+
+    if not git_succeeds(
+        [
+            "merge-base",
+            "--is-ancestor",
+            authorized,
+            upstream,
+        ]
+    ):
+        raise SystemExit(
+            f"Cannot record {action}: commit {authorized} is not "
+            f"contained in {upstream}, so the push did not happen. "
+            "Recording it would create evidence for work that was "
+            "never done."
+        )
+
+    return (
+        f"commit {authorized} is contained in {upstream} at "
+        f"{git_output(['rev-parse', upstream]) or 'unknown'}."
+    )
+
+
+EVIDENCE_BY_ACTION = {
+    "commit": commit_evidence,
+    "merge": merge_evidence,
+    "push": push_evidence,
+}
+
+
+def cmd_integration_performed(args):
+    """
+    Record that an authorized integration action was carried out.
+
+    The controller checks the repository rather than believing the
+    caller. An action may only be recorded from AUTHORIZED, so the
+    order is always: a human authorizes this exact boundary, the
+    action happens, and only then is it recorded.
+    """
+
+    data = load()
+
+    if data["state"] != "RUNNING":
+        raise SystemExit(
+            "Cannot record an integration action while "
+            f"state={data['state']}"
+        )
+
+    action = args.action
+
+    entry = require_declared_action(data, action)
+
+    require_integrate_phase(data, f"record {action}")
+
+    if entry["status"] == ACTION_PERFORMED:
+        raise SystemExit(
+            f"Integration action {action} is already recorded as "
+            f"{ACTION_PERFORMED}."
+        )
+
+    if entry["status"] != ACTION_AUTHORIZED:
+        raise SystemExit(
+            f"Integration action {action} is {entry['status']}, not "
+            f"{ACTION_AUTHORIZED}. A human must approve a "
+            f"GIT_INTEGRATION gate naming {action} before it may be "
+            "performed or recorded."
+        )
+
+    evidence = EVIDENCE_BY_ACTION[action](entry, action)
+
+    entry["status"] = ACTION_PERFORMED
+    entry["evidence"] = evidence
+
+    save(data)
+
+    audit(
+        "INTEGRATION_ACTION_PERFORMED",
+        task_id=data["task_id"],
+        parent_task_id=data["parent_task_id"],
+        action=action,
+        gate_id=entry["gate_id"],
+        evidence=evidence,
+    )
+
+
 def cmd_ready(_):
     data = load()
 
@@ -1613,6 +2745,22 @@ def cmd_ready(_):
             "Expected PASS or justified NOT_REQUIRED."
         )
 
+    # READY_FOR_HUMAN_REVIEW must mean the Integration Task itself is
+    # complete. An action still awaiting authorization cannot be
+    # carried into completion and authorized afterwards, because a
+    # gate can only be opened while RUNNING — completing here would
+    # strand it permanently.
+    outstanding = unresolved_actions(data)
+
+    if outstanding:
+        raise SystemExit(
+            "Cannot mark ready while a declared integration action "
+            f"is unresolved: {', '.join(outstanding)}. Each must be "
+            "authorized by a GIT_INTEGRATION gate and performed, or "
+            "declined by a human. Approval to commit is not approval "
+            "to push."
+        )
+
     data["state"] = "READY_FOR_HUMAN_REVIEW"
     data["human_gate"] = None
     data["completed_at"] = now()
@@ -1626,6 +2774,10 @@ def cmd_ready(_):
         parent_task_id=data["parent_task_id"],
         targeted_result=targeted["result"],
         full_result=full["result"],
+        integration_actions={
+            entry["action"]: entry["status"]
+            for entry in (data["integration_actions"] or [])
+        },
     )
 
 
@@ -1682,7 +2834,34 @@ def main():
     p = sub.add_parser("start-integration")
     p.add_argument("task_id")
     p.add_argument("title")
+    p.add_argument(
+        "--action",
+        action="append",
+        choices=[
+            *INTEGRATION_ACTIONS,
+            NO_INTEGRATION_ACTION,
+        ],
+        help=(
+            "a git action this Integration Task intends to perform; "
+            "repeat for each. Every declared action must be "
+            "authorized and performed, or declined by a human, "
+            "before the task may complete."
+        ),
+    )
     p.set_defaults(func=cmd_start_integration)
+
+    p = sub.add_parser("integration")
+    integration_sub = p.add_subparsers(
+        dest="integration_cmd",
+        required=True,
+    )
+
+    p = integration_sub.add_parser("performed")
+    p.add_argument(
+        "action",
+        choices=sorted(INTEGRATION_ACTIONS),
+    )
+    p.set_defaults(func=cmd_integration_performed)
 
     p = sub.add_parser("migrate-v3")
     p.add_argument(
@@ -1694,7 +2873,26 @@ def main():
         nargs="?",
         default=None,
     )
+    p.add_argument(
+        "--action",
+        action="append",
+        choices=[
+            *INTEGRATION_ACTIONS,
+            NO_INTEGRATION_ACTION,
+        ],
+    )
     p.set_defaults(func=cmd_migrate_v3)
+
+    p = sub.add_parser("migrate-v31")
+    p.add_argument(
+        "--action",
+        action="append",
+        choices=[
+            *INTEGRATION_ACTIONS,
+            NO_INTEGRATION_ACTION,
+        ],
+    )
+    p.set_defaults(func=cmd_migrate_v31)
 
     p = sub.add_parser("phase")
     p.add_argument(
@@ -1737,6 +2935,15 @@ def main():
     )
     p.add_argument("question")
     p.add_argument("recommendation")
+    p.add_argument(
+        "--action",
+        choices=sorted(INTEGRATION_ACTIONS),
+        default=None,
+        help=(
+            "the single declared integration action this gate "
+            "authorizes; required for GIT_INTEGRATION"
+        ),
+    )
     p.add_argument(
         "--alternative",
         action="append",

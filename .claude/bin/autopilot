@@ -32,6 +32,9 @@ rather than assumed:
       fails closed when it cannot;
     untracked entries the run left behind block completion, which a
       tracked-content diff check cannot see;
+    an Integration Task carrying an unauthorized git action stops at
+      the human decision rather than completing around it, and stops
+      in the phase where that decision can still be requested;
     shell and interpreter wrappers are refused, so argv-only
       execution cannot be re-opened through a wrapper.
 
@@ -120,8 +123,22 @@ WORK_SEQUENCE = [
 
 INTEGRATION_SEQUENCE = [
     "ANALYZE",
+    "INTEGRATE",
     "FINAL_VERIFY",
 ]
+
+# The one phase where a GIT_INTEGRATION gate may be opened and an
+# action may be recorded. Leaving it with a decision still outstanding
+# strands that decision, so the transition out of it is guarded.
+INTEGRATE_PHASE = "INTEGRATE"
+
+# Statuses that end a declared integration action's life. Anything
+# else is a decision a human still owes, and autopilot may not
+# complete a task that is carrying one.
+RESOLVED_ACTION_STATUSES = {
+    "PERFORMED",
+    "DECLINED",
+}
 
 SEQUENCE_BY_TASK_KIND = {
     "WORK": WORK_SEQUENCE,
@@ -155,6 +172,20 @@ VALID_GATE_TYPES = {
     "SCOPE_EXPANSION",
     "UNRESOLVED_DISCUSS",
     "OTHER",
+}
+
+# An integration decision authorizes exactly one git boundary, so the
+# gate that carries it names exactly one action. These mirror
+# statusctl's own set; the controller remains the authority that
+# accepts or refuses a particular action for a particular task.
+INTEGRATION_ONLY_GATE_TYPES = {
+    "GIT_INTEGRATION",
+}
+
+INTEGRATION_ACTIONS = {
+    "commit",
+    "push",
+    "merge",
 }
 
 # Both verifications are re-established at FINAL_VERIFY, in this
@@ -214,7 +245,13 @@ WORKER_DISALLOWED_TOOLS = (
     "Bash(./.claude/bin/statusctl gate *)",
     "Bash(./.claude/bin/statusctl ready)",
     "Bash(./.claude/bin/statusctl fail *)",
+    "Bash(./.claude/bin/statusctl integration *)",
     "Bash(./.claude/bin/statusctl migrate-v3 *)",
+    # migrate-v31 needs its own entries: the pattern above requires a
+    # following space, so it does not match this command, and the
+    # bare form carries no argument to match at all.
+    "Bash(./.claude/bin/statusctl migrate-v31)",
+    "Bash(./.claude/bin/statusctl migrate-v31 *)",
     "Bash(statusctl *)",
 )
 
@@ -955,6 +992,12 @@ def build_brief(runtime):
                 "gate_type": (
                     "required when outcome is HUMAN_GATE_REQUIRED"
                 ),
+                "action": (
+                    "required when gate_type is GIT_INTEGRATION: "
+                    "the single declared integration action the "
+                    "gate authorizes (commit, push or merge). "
+                    "Approval to commit is not approval to push."
+                ),
                 "question": (
                     "required when outcome is HUMAN_GATE_REQUIRED"
                 ),
@@ -1331,6 +1374,46 @@ def summarize_verification(completed, phase, passed):
 # ================================================================
 
 
+def validated_gate_action(gate_type, action):
+    """
+    Resolve the integration action a gate authorizes, failing closed.
+
+    An integration gate that names no action would authorize nothing
+    in particular and everything by implication, which is exactly
+    what the declared-scope model exists to prevent. The controller
+    refuses such a gate anyway; refusing here means the orchestrator
+    reports which requirement the worker missed, rather than
+    surfacing a controller error for a request it should never have
+    sent.
+
+    An action on any other kind of decision is refused rather than
+    dropped. Silently discarding it would throw away what the worker
+    asked for, and a worker confused about which decision it is
+    requesting is not a worker whose gate should be opened.
+    """
+
+    if gate_type in INTEGRATION_ONLY_GATE_TYPES:
+        if action not in INTEGRATION_ACTIONS:
+            raise blocked(
+                "Worker requested a "
+                f"{gate_type} gate with action {action!r}. It must "
+                "name exactly one declared integration action "
+                f"({', '.join(sorted(INTEGRATION_ACTIONS))}); "
+                "approval to commit is not approval to push."
+            )
+
+        return action
+
+    if action is not None:
+        raise blocked(
+            f"Worker supplied action {action!r} on a {gate_type} "
+            "gate. An action is only meaningful for "
+            f"{', '.join(sorted(INTEGRATION_ONLY_GATE_TYPES))}."
+        )
+
+    return None
+
+
 def open_gate(response):
     """
     Open a Human Gate on the worker's behalf and stop.
@@ -1339,6 +1422,10 @@ def open_gate(response):
     reads the resulting gate ID back out of runtime state rather than
     inventing or echoing one, so the ID a supervisor sees is the ID
     the controller actually assigned.
+
+    For an integration decision the gate carries the one action it
+    authorizes, threaded through from the worker's structured
+    response. Autopilot binds it; only a human decides it.
     """
 
     gate_type = response.get("gate_type")
@@ -1348,6 +1435,11 @@ def open_gate(response):
             "Worker requested a Human Gate with an invalid "
             f"gate_type: {gate_type!r}."
         )
+
+    action = validated_gate_action(
+        gate_type,
+        response.get("action"),
+    )
 
     question = (response.get("question") or "").strip()
     recommendation = (
@@ -1367,6 +1459,14 @@ def open_gate(response):
         question,
         recommendation,
     ]
+
+    if action is not None:
+        argv.extend(
+            [
+                "--action",
+                action,
+            ]
+        )
 
     for alternative in response.get("alternatives") or []:
         argv.extend(
@@ -1823,6 +1923,48 @@ def assert_worktree_uncontaminated(baseline):
         )
 
 
+def unresolved_integration_actions(runtime):
+    return [
+        entry.get("action")
+        for entry in (
+            runtime.get("integration_actions")
+            or []
+        )
+        if entry.get("status") not in RESOLVED_ACTION_STATUSES
+    ]
+
+
+def assert_integration_scope_resolved(runtime):
+    """
+    Stop an Integration Task that still owes a human decision.
+
+    `statusctl ready` refuses this case on its own, so autopilot
+    would fail closed regardless. It is checked here so the run ends
+    as WAITING_FOR_HUMAN rather than BLOCKED: an action awaiting
+    authorization is a decision boundary, not a technical fault, and
+    a supervisor should be told which boundary it is.
+    """
+
+    outstanding = unresolved_integration_actions(runtime)
+
+    if not outstanding:
+        return
+
+    raise Stop(
+        "WAITING_FOR_HUMAN",
+        EXIT_WAITING_FOR_HUMAN,
+        (
+            "Integration actions still require a human decision: "
+            + ", ".join(outstanding)
+            + ". Each must be authorized by a GIT_INTEGRATION gate "
+            "and performed, or declined. Autopilot opens gates but "
+            "never resolves them."
+        ),
+        unresolved_integration_actions=outstanding,
+        state=runtime.get("state"),
+    )
+
+
 def assert_completion_preconditions(baseline):
     """
     Hold the worktree to both completion checks before `ready`.
@@ -1891,11 +2033,14 @@ def run_cycle(runtime, timeout, baseline):
 
     if following is None:
         # Order matters: fresh evidence first, then the worktree
-        # check the contract requires, then a report that describes
-        # both, and only then completion.
+        # check the contract requires, then the integration scope,
+        # then a report that describes all of it, and only then
+        # completion.
         verification = run_final_verification(runtime)
 
         assert_completion_preconditions(baseline)
+
+        assert_integration_scope_resolved(runtime)
 
         statusctl_checked("report")
 
@@ -1910,6 +2055,14 @@ def run_cycle(runtime, timeout, baseline):
             ),
             verification=verification,
         )
+
+    # Checked before the transition, not only at completion. The gate
+    # that resolves a declared action is INTEGRATE-only, so advancing
+    # out of INTEGRATE with one outstanding would leave a human
+    # holding a decision the runtime refuses to accept — the run would
+    # name a gate that could no longer be opened.
+    if runtime.get("phase") == INTEGRATE_PHASE:
+        assert_integration_scope_resolved(runtime)
 
     statusctl_checked(
         "phase",

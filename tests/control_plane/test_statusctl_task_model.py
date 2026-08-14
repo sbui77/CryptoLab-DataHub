@@ -130,7 +130,7 @@ def test_fresh_runtime_uses_schema_v3(
 
     assert (
         data["schema_version"]
-        == "3.0"
+        == "3.1"
     )
 
     assert data["task_kind"] is None
@@ -149,7 +149,7 @@ def test_start_creates_work_task(
 
     assert (
         status["schema_version"]
-        == "3.0"
+        == "3.1"
     )
 
     assert (
@@ -262,6 +262,8 @@ def test_start_integration_requires_ready_work(
         "start-integration",
         "work-task-integration-001",
         "Integrate Work Task",
+        "--action",
+        "none",
     )
 
     assert result.returncode != 0
@@ -288,6 +290,8 @@ def test_start_integration_captures_parent_work_task(
         "start-integration",
         "work-task-integration-001",
         "Integrate Work Task",
+        "--action",
+        "none",
     )
 
     assert result.returncode == 0, (
@@ -331,14 +335,25 @@ def test_integration_task_can_open_git_gate(
         "start-integration",
         "work-task-integration-001",
         "Integrate Work Task",
+        "--action",
+        "commit",
     )
 
     assert started.returncode == 0
+
+    # Integration actions are gated in INTEGRATE, which is where the
+    # task stands at its boundary.
+    assert run_statusctl(
+        "phase",
+        "INTEGRATE",
+    ).returncode == 0
 
     opened = run_statusctl(
         "gate",
         "open",
         "GIT_INTEGRATION",
+        "--action",
+        "commit",
         "Approve commit?",
         "Approve integration action.",
     )
@@ -377,6 +392,8 @@ def test_integration_task_rejects_work_only_phase(
         "start-integration",
         "work-task-integration-001",
         "Integrate Work Task",
+        "--action",
+        "none",
     )
 
     assert started.returncode == 0
@@ -440,7 +457,7 @@ def test_migrate_v2_work_to_v3(
 
     assert (
         status["schema_version"]
-        == "3.0"
+        == "3.1"
     )
 
     assert (
@@ -515,6 +532,8 @@ def test_migrate_v2_integration_with_parent(
         "migrate-v3",
         "INTEGRATION",
         "parent-work-001",
+        "--action",
+        "commit",
     )
 
     assert result.returncode == 0, (
@@ -526,7 +545,7 @@ def test_migrate_v2_integration_with_parent(
 
     assert (
         status["schema_version"]
-        == "3.0"
+        == "3.1"
     )
 
     assert (

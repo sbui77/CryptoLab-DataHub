@@ -2020,6 +2020,9 @@ def test_worker_session_cannot_resolve_or_migrate(
         "[os.environ['STATUSCTL'], 'gate', 'approve', "
         "'HG-20260813-001', 'ok']",
         "[os.environ['STATUSCTL'], 'migrate-v3', 'WORK']",
+        "[os.environ['STATUSCTL'], 'migrate-v31']",
+        "[os.environ['STATUSCTL'], 'integration', 'performed', "
+        "'commit']",
         "[os.environ['STATUSCTL'], 'ready']",
         "[os.environ['STATUSCTL'], 'fail', 'giving up']",
     ):
@@ -2735,6 +2738,8 @@ def test_integration_final_verify_does_not_retest_product_code(
         "start-integration",
         "autopilot-integration-001",
         "Integrate the reviewed work",
+        "--action",
+        "none",
     )
 
     run_statusctl(
@@ -3603,6 +3608,727 @@ def test_material_entry_classification(
             )
             is material
         ), path
+
+
+# ================================================================
+# INTEGRATION SCOPE — AUTOPILOT STOPS AT AN UNAUTHORIZED ACTION
+# ================================================================
+
+
+def test_integration_sequence_includes_the_integrate_phase(
+    load_autopilot_module,
+):
+    """
+    The declared git actions are gated and performed in INTEGRATE, so
+    a commit is not recorded as having happened during ANALYZE.
+    """
+
+    module = load_autopilot_module()
+
+    assert module.INTEGRATION_SEQUENCE == [
+        "ANALYZE",
+        "INTEGRATE",
+        "FINAL_VERIFY",
+    ]
+
+    # A Work Task never integrates, so the phase is not part of its
+    # lifecycle.
+    assert (
+        "INTEGRATE"
+        not in module.WORK_SEQUENCE
+    )
+
+
+def test_autopilot_stops_on_an_unresolved_integration_action(
+    autopilot_repo: Path,
+    run_autopilot,
+    make_worker,
+):
+    """
+    An Integration Task carrying an unauthorized push must stop at
+    the human decision, not complete around it.
+
+    Autopilot opens gates and never resolves them, so the run ends as
+    WAITING_FOR_HUMAN with the outstanding action named.
+    """
+
+    start_work_task(
+        autopilot_repo
+    )
+
+    seed_stale_results(
+        autopilot_repo
+    )
+
+    advance_to(
+        autopilot_repo,
+        "FINAL_VERIFY",
+    )
+
+    run_statusctl(
+        autopilot_repo,
+        "ready",
+    )
+
+    run_statusctl(
+        autopilot_repo,
+        "start-integration",
+        "autopilot-integration-002",
+        "Integrate the reviewed work",
+        "--action",
+        "push",
+    )
+
+    for kind in (
+        "targeted",
+        "full",
+    ):
+        run_statusctl(
+            autopilot_repo,
+            "test-not-required",
+            kind,
+            "Integration Task never re-tests product code.",
+        )
+
+    run_statusctl(
+        autopilot_repo,
+        "phase",
+        "FINAL_VERIFY",
+    )
+
+    result = run_autopilot(
+        "run",
+        "--max-cycles",
+        "1",
+        worker=make_worker(
+            WORKER_PASS
+        ),
+    )
+
+    assert (
+        result.returncode
+        == EXIT_WAITING_FOR_HUMAN
+    ), (
+        result.stdout
+        or result.stderr
+    )
+
+    payload = result_payload(
+        result
+    )
+
+    assert payload["unresolved_integration_actions"] == [
+        "push",
+    ]
+
+    status = read_status(
+        autopilot_repo
+    )
+
+    assert status["state"] == "RUNNING"
+
+    assert status["completed_at"] is None
+
+
+# ================================================================
+# AR-01 — AUTOPILOT OPENS ACTION-BOUND INTEGRATION GATES
+# ================================================================
+#
+# A GIT_INTEGRATION gate must name exactly one declared action. The
+# worker cannot open gates — statusctl is read-only inside its
+# session — so it asks, and autopilot opens. If autopilot cannot pass
+# the action through, the orchestrated integration path stops at the
+# one boundary INTEGRATE exists to reach.
+#
+# Opening is autonomous. Resolving never is: these pin that autopilot
+# stops at the gate rather than deciding it.
+
+
+def integration_task_at_integrate(
+    autopilot_repo: Path,
+    *actions: str,
+) -> None:
+    """
+    An Integration Task standing at its integration boundary.
+    """
+
+    start_work_task(
+        autopilot_repo
+    )
+
+    seed_stale_results(
+        autopilot_repo
+    )
+
+    advance_to(
+        autopilot_repo,
+        "FINAL_VERIFY",
+    )
+
+    run_statusctl(
+        autopilot_repo,
+        "ready",
+    )
+
+    args = [
+        "start-integration",
+        "autopilot-integration-003",
+        "Integrate the reviewed work",
+    ]
+
+    for action in actions or (
+        "none",
+    ):
+        args.extend(
+            [
+                "--action",
+                action,
+            ]
+        )
+
+    run_statusctl(
+        autopilot_repo,
+        *args,
+    )
+
+    for kind in (
+        "targeted",
+        "full",
+    ):
+        run_statusctl(
+            autopilot_repo,
+            "test-not-required",
+            kind,
+            "Integration Task never re-tests product code.",
+        )
+
+    run_statusctl(
+        autopilot_repo,
+        "phase",
+        "INTEGRATE",
+    )
+
+
+def gate_worker(
+    body: str,
+) -> str:
+    return (
+        "print(json.dumps({'outcome': 'HUMAN_GATE_REQUIRED', "
+        "'summary': 'the action needs authorization', "
+        + body
+        + "'question': 'Approve the action?', "
+        "'recommendation': 'Approve it.'}))\n"
+    )
+
+
+WORKER_GATE_INTEGRATION = gate_worker(
+    "'gate_type': 'GIT_INTEGRATION', 'action': 'commit', "
+)
+
+WORKER_GATE_INTEGRATION_NO_ACTION = gate_worker(
+    "'gate_type': 'GIT_INTEGRATION', "
+)
+
+WORKER_GATE_INTEGRATION_UNKNOWN_ACTION = gate_worker(
+    "'gate_type': 'GIT_INTEGRATION', 'action': 'rebase', "
+)
+
+WORKER_GATE_ACTION_ON_OTHER_TYPE = gate_worker(
+    "'gate_type': 'SEMANTIC_DECISION', 'action': 'push', "
+)
+
+
+def assert_gate_was_not_opened(
+    autopilot_repo: Path,
+    result: subprocess.CompletedProcess[str],
+) -> None:
+    assert (
+        result.returncode
+        == EXIT_BLOCKED_TECHNICAL
+    ), (
+        result.stdout
+        or result.stderr
+    )
+
+    status = read_status(
+        autopilot_repo
+    )
+
+    assert status["state"] == "RUNNING"
+
+    assert status["human_gate"] is None
+
+    assert status["phase"] == "INTEGRATE"
+
+    assert not any(
+        event["event"] == "HUMAN_GATE_OPENED"
+        for event in read_audit(
+            autopilot_repo
+        )
+    )
+
+
+def test_autopilot_opens_an_action_bound_integration_gate(
+    autopilot_repo: Path,
+    run_autopilot,
+    make_worker,
+):
+    """
+    AR-01: the worker's action reaches the gate.
+    """
+
+    integration_task_at_integrate(
+        autopilot_repo,
+        "commit",
+    )
+
+    result = run_autopilot(
+        "run",
+        "--max-cycles",
+        "1",
+        worker=make_worker(
+            WORKER_GATE_INTEGRATION
+        ),
+    )
+
+    assert (
+        result.returncode
+        == EXIT_WAITING_FOR_HUMAN
+    ), (
+        result.stdout
+        or result.stderr
+    )
+
+    status = read_status(
+        autopilot_repo
+    )
+
+    assert (
+        status["state"]
+        == "BLOCKED_HUMAN_DECISION"
+    )
+
+    gate = status["human_gate"]
+
+    assert gate["type"] == "GIT_INTEGRATION"
+
+    assert gate["action"] == "commit"
+
+    payload = result_payload(
+        result
+    )
+
+    assert (
+        payload["human_gate"]["gate_id"]
+        == gate["gate_id"]
+    )
+
+    # Opening is autonomous; deciding is not. The action must still be
+    # awaiting a human.
+    assert (
+        status["integration_actions"][0]["status"]
+        == "DECLARED"
+    )
+
+    events = {
+        event["event"]
+        for event in read_audit(
+            autopilot_repo
+        )
+    }
+
+    assert "HUMAN_GATE_OPENED" in events
+
+    assert not (
+        events
+        & {
+            "HUMAN_GATE_APPROVED",
+            "HUMAN_GATE_ALTERNATIVE_CHOSEN",
+            "HUMAN_GATE_REJECTED",
+        }
+    )
+
+
+def test_autopilot_refuses_an_integration_gate_with_no_action(
+    autopilot_repo: Path,
+    run_autopilot,
+    make_worker,
+):
+    """
+    AR-01: an unnamed integration gate fails closed inside autopilot.
+
+    The controller would refuse it anyway. Refusing here too means the
+    orchestrator reports which requirement the worker missed, instead
+    of surfacing a controller error for a request it should never have
+    sent.
+    """
+
+    integration_task_at_integrate(
+        autopilot_repo,
+        "commit",
+    )
+
+    result = run_autopilot(
+        "run",
+        "--max-cycles",
+        "1",
+        worker=make_worker(
+            WORKER_GATE_INTEGRATION_NO_ACTION
+        ),
+    )
+
+    assert_gate_was_not_opened(
+        autopilot_repo,
+        result,
+    )
+
+    assert "action" in json.dumps(
+        result_payload(
+            result
+        )
+    ).lower()
+
+
+def test_autopilot_refuses_an_unknown_integration_action(
+    autopilot_repo: Path,
+    run_autopilot,
+    make_worker,
+):
+    """
+    AR-01: the worker cannot invent an action.
+    """
+
+    integration_task_at_integrate(
+        autopilot_repo,
+        "commit",
+    )
+
+    result = run_autopilot(
+        "run",
+        "--max-cycles",
+        "1",
+        worker=make_worker(
+            WORKER_GATE_INTEGRATION_UNKNOWN_ACTION
+        ),
+    )
+
+    assert_gate_was_not_opened(
+        autopilot_repo,
+        result,
+    )
+
+
+def test_autopilot_refuses_an_action_on_a_non_integration_gate(
+    autopilot_repo: Path,
+    run_autopilot,
+    make_worker,
+):
+    """
+    AR-01: an action binding belongs to an integration decision only.
+
+    Silently dropping it would discard what the worker asked for; the
+    mismatch is reported instead.
+    """
+
+    integration_task_at_integrate(
+        autopilot_repo,
+        "commit",
+    )
+
+    result = run_autopilot(
+        "run",
+        "--max-cycles",
+        "1",
+        worker=make_worker(
+            WORKER_GATE_ACTION_ON_OTHER_TYPE
+        ),
+    )
+
+    assert_gate_was_not_opened(
+        autopilot_repo,
+        result,
+    )
+
+
+def test_worker_brief_states_the_action_contract(
+    load_autopilot_module,
+):
+    """
+    AR-01: a worker can only supply what it is told to supply.
+    """
+
+    module = load_autopilot_module()
+
+    brief = json.loads(
+        module.build_brief(
+            {
+                "task_id": "int-001",
+                "task_title": "Integrate",
+                "task_kind": "INTEGRATION",
+                "parent_task_id": "work-001",
+                "phase": "INTEGRATE",
+            }
+        )
+    )
+
+    schema = brief["response_schema"]
+
+    assert "action" in schema
+
+    assert (
+        "GIT_INTEGRATION"
+        in schema["action"]
+    )
+
+
+# ================================================================
+# ER-08 — THE RUN STOPS WHERE THE DECISION CAN STILL BE REQUESTED
+# ================================================================
+#
+# Stopping fail-closed is not enough on its own. A GIT_INTEGRATION
+# gate may only be opened in INTEGRATE, so an orchestrator that
+# advances past that phase while an action is still unresolved leaves
+# the human holding a decision they cannot action: the run's own
+# message names a gate that the state it left behind refuses to open.
+#
+# So the scope is checked before the transition out of INTEGRATE, not
+# only at completion.
+
+
+def test_autopilot_stops_in_integrate_while_an_action_is_unresolved(
+    autopilot_repo: Path,
+    run_autopilot,
+    make_worker,
+):
+    """
+    ER-08: the phase must not move past the unresolved decision.
+    """
+
+    integration_task_at_integrate(
+        autopilot_repo,
+        "commit",
+    )
+
+    result = run_autopilot(
+        "run",
+        "--max-cycles",
+        "3",
+        worker=make_worker(
+            WORKER_PASS
+        ),
+        timeout=120.0,
+    )
+
+    assert (
+        result.returncode
+        == EXIT_WAITING_FOR_HUMAN
+    ), (
+        result.stdout
+        or result.stderr
+    )
+
+    payload = result_payload(
+        result
+    )
+
+    assert payload["unresolved_integration_actions"] == [
+        "commit",
+    ]
+
+    status = read_status(
+        autopilot_repo
+    )
+
+    assert status["state"] == "RUNNING"
+
+    # The whole point: still standing where the gate is legal.
+    assert status["phase"] == "INTEGRATE"
+
+    assert status["completed_at"] is None
+
+    assert (
+        status["integration_actions"][0]["status"]
+        == "DECLARED"
+    )
+
+
+def test_the_awaited_gate_can_be_opened_where_autopilot_stopped(
+    autopilot_repo: Path,
+    run_autopilot,
+    make_worker,
+):
+    """
+    ER-08: the state autopilot leaves must accept the decision it asks
+    for. This is the assertion the previous behaviour failed.
+    """
+
+    integration_task_at_integrate(
+        autopilot_repo,
+        "commit",
+    )
+
+    assert run_autopilot(
+        "run",
+        "--max-cycles",
+        "3",
+        worker=make_worker(
+            WORKER_PASS
+        ),
+        timeout=120.0,
+    ).returncode == EXIT_WAITING_FOR_HUMAN
+
+    # run_statusctl asserts a zero exit, so this call failing is the
+    # failure being guarded against.
+    run_statusctl(
+        autopilot_repo,
+        "gate",
+        "open",
+        "GIT_INTEGRATION",
+        "--action",
+        "commit",
+        "Approve the commit?",
+        "Approve it.",
+    )
+
+    gate = read_status(
+        autopilot_repo
+    )["human_gate"]
+
+    assert gate["type"] == "GIT_INTEGRATION"
+
+    assert gate["action"] == "commit"
+
+
+def test_autopilot_advances_out_of_integrate_once_scope_is_resolved(
+    autopilot_repo: Path,
+    run_autopilot,
+    make_worker,
+):
+    """
+    ER-08 must gate the transition, not forbid it.
+
+    A declined action is resolved, so the task proceeds to completion
+    exactly as before.
+    """
+
+    integration_task_at_integrate(
+        autopilot_repo,
+        "commit",
+    )
+
+    run_statusctl(
+        autopilot_repo,
+        "gate",
+        "open",
+        "GIT_INTEGRATION",
+        "--action",
+        "commit",
+        "Approve the commit?",
+        "Approve it.",
+    )
+
+    gate_id = read_status(
+        autopilot_repo
+    )["human_gate"]["gate_id"]
+
+    run_statusctl(
+        autopilot_repo,
+        "gate",
+        "reject",
+        gate_id,
+        "The commit belongs to a later integration.",
+    )
+
+    result = run_autopilot(
+        "run",
+        "--max-cycles",
+        "3",
+        worker=make_worker(
+            WORKER_PASS
+        ),
+        timeout=120.0,
+    )
+
+    assert result.returncode == EXIT_OK, (
+        result.stdout
+        or result.stderr
+    )
+
+    status = read_status(
+        autopilot_repo
+    )
+
+    assert (
+        status["state"]
+        == "READY_FOR_HUMAN_REVIEW"
+    )
+
+    assert (
+        status["integration_actions"][0]["status"]
+        == "DECLINED"
+    )
+
+
+# ================================================================
+# AR-02 — THE REDUNDANT DENYLIST COVERS SCHEMA 3.1
+# ================================================================
+
+
+REQUIRED_WORKER_DENIES = {
+    "Bash(./.claude/bin/statusctl start *)",
+    "Bash(./.claude/bin/statusctl start-integration *)",
+    "Bash(./.claude/bin/statusctl phase *)",
+    "Bash(./.claude/bin/statusctl test *)",
+    "Bash(./.claude/bin/statusctl test-not-required *)",
+    "Bash(./.claude/bin/statusctl gate *)",
+    "Bash(./.claude/bin/statusctl ready)",
+    "Bash(./.claude/bin/statusctl fail *)",
+    # Deliberately the broad form. A worker session has no business
+    # with any integration subcommand, so the rule is not narrowed to
+    # the one that exists today.
+    "Bash(./.claude/bin/statusctl integration *)",
+    "Bash(./.claude/bin/statusctl migrate-v3 *)",
+    # Both spellings: the pattern above requires a following space, so
+    # it never matches migrate-v31, and the bare form carries no
+    # argument to match.
+    "Bash(./.claude/bin/statusctl migrate-v31)",
+    "Bash(./.claude/bin/statusctl migrate-v31 *)",
+    "Bash(statusctl *)",
+}
+
+
+def test_worker_denylist_covers_schema_31_state_changes(
+    load_autopilot_module,
+):
+    """
+    AR-02: every state-changing subcommand is refused by every layer.
+
+    The read-only shim is the control that actually holds; this list
+    is the redundant one the design deliberately keeps. A command that
+    can write evidence or migrate the runtime must appear in both.
+
+    Membership is asserted exactly, rather than by searching a joined
+    string. A substring test passes on a rule that merely contains the
+    text — a malformed pattern, a wrong path prefix, or a rule that
+    happens to mention the command in passing would all satisfy it,
+    which is precisely the kind of near-miss a permission list must
+    not be checked with.
+    """
+
+    module = load_autopilot_module()
+
+    denied = module.WORKER_DISALLOWED_TOOLS
+
+    # A set comparison would silently absorb a duplicated entry, so
+    # the tuple is checked for duplicates before it becomes one.
+    assert len(set(denied)) == len(denied), denied
+
+    missing = sorted(
+        REQUIRED_WORKER_DENIES
+        - set(denied)
+    )
+
+    assert not missing, missing
 
 
 # ================================================================

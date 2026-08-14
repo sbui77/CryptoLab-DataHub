@@ -70,11 +70,12 @@ before substantive implementation work begins.
 
 ## 2A. Work Tasks and Integration Tasks (Semantics A)
 
-Runtime schema 3.0 makes the task model explicit. Every task-bearing
+Runtime schema 3.1 makes the task model explicit. Every task-bearing
 runtime state carries:
 
-    task_kind        WORK | INTEGRATION
-    parent_task_id   the parent Work Task ID, for INTEGRATION only
+    task_kind            WORK | INTEGRATION
+    parent_task_id       the parent Work Task ID, INTEGRATION only
+    integration_actions  the declared git scope, INTEGRATION only
 
 ### Work Task
 
@@ -104,9 +105,17 @@ not integration.
 ### Integration Task
 
 An Integration Task integrates work that has already been reviewed. It
-starts only from a Work Task in READY_FOR_HUMAN_REVIEW:
+starts only from a Work Task in READY_FOR_HUMAN_REVIEW, and it
+declares the git actions it intends to perform:
 
-    ./.claude/bin/statusctl start-integration TASK_ID TITLE
+    ./.claude/bin/statusctl start-integration TASK_ID TITLE \
+      --action commit --action push
+
+Each declared action is `commit`, `push` or `merge`. The scope is
+required: omitting `--action` is refused rather than read as "no
+boundary", because an absent scope is the accident the field exists to
+prevent. An Integration Task that really crosses no git boundary says
+so with `--action none`.
 
     task_kind      = INTEGRATION
     parent_task_id = the completed Work Task's task_id
@@ -122,10 +131,42 @@ auditable.
 Its lifecycle is deliberately narrow:
 
     ANALYZE
+    INTEGRATE
     FINAL_VERIFY
+
+The declared actions are gated and performed in INTEGRATE, and the
+controller enforces that placement: `gate open GIT_INTEGRATION` and
+`integration performed` are both refused in any other phase. A commit
+gated during ANALYZE is a commit recorded as analysis, and one gated
+during FINAL_VERIFY is an action taken after the verification meant to
+cover it.
 
 An Integration Task never implements and never re-tests product code.
 Work-only phases such as IMPLEMENT are rejected by the controller.
+
+### Declared integration scope
+
+Every declared action carries its own status:
+
+    DECLARED    intended, not yet decided by a human
+    AUTHORIZED  a human approved a gate naming exactly this action
+    PERFORMED   carried out, with evidence the controller observed
+    DECLINED    a human rejected it; explicitly not in scope
+
+An action moves only through a Human Gate that names it. Approval to
+commit is not approval to push, and no action may be inferred from
+another action's approval.
+
+READY_FOR_HUMAN_REVIEW means the Integration Task itself is complete.
+Every declared action must therefore be PERFORMED or DECLINED before
+`ready` is accepted. An action left DECLARED blocks completion, and it
+cannot be authorized afterwards: a gate may only be opened while
+RUNNING, so completing first would strand the decision permanently.
+
+That is why scope is declared at the start rather than discovered at
+the end. A completed task is never reopened to authorize an action it
+forgot to gate; the boundary is stated up front, where the human who
+approves the first action can already see every action intended.
 
 If integration reveals that the work itself is wrong, the correct
 response is a new Work Task, not an Integration Task that quietly
@@ -225,7 +266,10 @@ Claude MAY autonomously invoke:
 
     ./.claude/bin/statusctl start TASK_ID TITLE
 
-    ./.claude/bin/statusctl start-integration TASK_ID TITLE
+    ./.claude/bin/statusctl start-integration TASK_ID TITLE \
+      [--action commit|push|merge|none ...]
+
+    ./.claude/bin/statusctl integration performed ACTION
 
     ./.claude/bin/statusctl phase PHASE
 
@@ -243,6 +287,9 @@ Claude MAY autonomously invoke:
 
     ./.claude/bin/statusctl gate open TYPE QUESTION RECOMMENDATION ...
 
+    ./.claude/bin/statusctl gate open GIT_INTEGRATION \
+      --action push QUESTION RECOMMENDATION ...
+
     ./.claude/bin/statusctl ready
 
     ./.claude/bin/statusctl fail SUMMARY
@@ -256,11 +303,53 @@ accurately record work already authorized by the task.
 INTEGRATION task and is legal only from a WORK task in
 READY_FOR_HUMAN_REVIEW.
 
-`migrate-v3` is NOT autonomous:
+`integration performed ACTION` records that an AUTHORIZED action was
+carried out, in the INTEGRATE phase. The controller verifies the
+repository rather than the claim, and each action is verified by what
+only that action leaves behind:
+
+    commit  an ordinary commit whose DIRECT PARENT is the authorized
+            commit; a merge commit does not satisfy it
+    merge   a real merge commit with two or more parents whose FIRST
+            PARENT is the authorized commit; an ordinary commit does
+            not satisfy it, and a fast-forward merge is refused
+            because it leaves no evidence a merge happened at all
+    push    HEAD must still be the exact commit the human authorized,
+            and that SHA must be contained in the configured upstream
+
+Descent is deliberately not sufficient for commit or merge. If a
+commit is authorized at A and then B and C are made, C is still a
+single-parent commit descending from A, so an ancestry test would
+accept two commits as evidence of the one that was approved. The same
+holds for a merge made after an intervening commit. Requiring the
+direct parent binds the record to exactly the transition a human
+authorized.
+
+First parent specifically, for a merge, because an Integration Task
+merges other work into the branch it is standing on: that branch's
+previous tip is the merge commit's first parent, and it is what the
+human authorized. Accepting the authorized commit in any parent
+position would also accept merging this branch into something else,
+which is a different action.
+
+A push gate authorizes publishing one exact commit. Publishing a
+later commit instead is a different action and needs its own decision,
+so "the branch is up to date" is never accepted as evidence on its
+own.
+
+`integration performed` is autonomous only because it cannot
+manufacture authorization — an action that no human approved cannot be
+recorded as performed.
+
+The migration commands are NOT autonomous:
 
     ./.claude/bin/statusctl migrate-v3 WORK
 
     ./.claude/bin/statusctl migrate-v3 INTEGRATION PARENT_TASK_ID
+
+    ./.claude/bin/statusctl migrate-v31
+
+    ./.claude/bin/statusctl migrate-v31 --action push
 
 Migration rewrites the operator's canonical runtime state, so it is an
 OPERATOR-INITIATED step. It is configured as `ask` in
@@ -268,7 +357,7 @@ OPERATOR-INITIATED step. It is configured as `ask` in
 moment of use.
 
 Claude must not migrate the canonical runtime on its own initiative.
-When a schema-2.0 runtime blocks progress, Claude must stop and report
+When a superseded runtime blocks progress, Claude must stop and report
 that migration is required, quoting the exact command, rather than
 requesting approval to run it as part of ordinary work.
 
@@ -475,6 +564,7 @@ STOP before performing any of the following:
 - git merge;
 - git cherry-pick;
 - git rebase;
+- any declared integration action not yet AUTHORIZED;
 - branch deletion;
 - worktree creation/removal unless explicitly authorized;
 - destructive Git operations;
@@ -644,15 +734,31 @@ Typical Work Task transitions:
 
 Typical Integration Task transitions:
 
-    start-integration
+    start-integration --action commit --action push
       ↓
     ANALYZE
       ↓
-    gate open GIT_INTEGRATION ...
+    INTEGRATE
+      ↓
+    gate open GIT_INTEGRATION --action commit ...
+      ↓
+    perform the commit
+      ↓
+    integration performed commit
+      ↓
+    gate open GIT_INTEGRATION --action push ...
+      ↓
+    perform the push
+      ↓
+    integration performed push
       ↓
     FINAL_VERIFY
       ↓
     ready
+
+Each declared action repeats the same three steps: a gate naming that
+action, the action itself, and the record of it. An action a human
+rejects is DECLINED and is never performed.
 
 The controller enforces the phase set for the current `task_kind`. A
 Work-only phase requested on an Integration Task is rejected without
@@ -737,18 +843,38 @@ is rejected by the controller without mutating runtime state. Start an
 Integration Task first, so the integration decision is recorded against
 a task whose identity says it is an integration.
 
-Each materially distinct integration boundary should have an explicit
-Human Gate whose decision scope states the authorized action.
+Each materially distinct integration boundary has its own Human Gate,
+and the gate names the exact action it authorizes:
+
+    ./.claude/bin/statusctl gate open GIT_INTEGRATION \
+      --action push QUESTION RECOMMENDATION
 
 Approval to commit does not automatically authorize push.
 
 Approval to push does not automatically authorize merge.
+
+This is enforced, not merely expected. A GIT_INTEGRATION gate must
+name exactly one action the Integration Task declared, approval moves
+only that action to AUTHORIZED, and an action the task never declared
+cannot be gated at all — scope is declared at the start and cannot be
+widened at the moment of use.
+
+A rejected action becomes DECLINED, which is the explicit record that
+it is not part of this Integration Task's approved scope. An
+ALTERNATIVE decision authorizes nothing and leaves the action awaiting
+a decision.
 
 The normal technical completion state is:
 
     READY_FOR_HUMAN_REVIEW
 
 with any unauthorized integration action still unperformed.
+
+For an Integration Task, completion additionally requires that every
+declared action is PERFORMED or DECLINED. An integration boundary that
+still belongs to the task cannot be carried past its completion, and a
+remaining boundary is integrated by a new Integration Task rather than
+by reopening a finished one.
 
 ---
 
@@ -856,6 +982,8 @@ A task reaches READY_FOR_HUMAN_REVIEW only when:
 - no unauthorized data mutation occurred;
 - no unauthorized policy mutation occurred;
 - no unauthorized Git integration action occurred;
+- for an Integration Task, every declared integration action is
+  PERFORMED or DECLINED;
 - runtime status accurately represents completed work;
 - runtime status passes internal structural and invariant validation;
 - current report accurately summarizes the task.
@@ -1058,12 +1186,22 @@ Required enforcement includes:
 - WORK requires `parent_task_id=null`;
 - INTEGRATION requires a non-empty `parent_task_id`;
 - INTEGRATION requires `parent_task_id` to differ from `task_id`;
-- the phase must belong to the phase set of the current `task_kind`.
+- the phase must belong to the phase set of the current `task_kind`;
+- `integration_actions` is null unless `task_kind=INTEGRATION`;
+- each declared action is one of `commit`, `push`, `merge`, appears
+  at most once, and is recorded in canonical order;
+- AUTHORIZED, PERFORMED and DECLINED each require the `gate_id` and
+  timestamp of the human decision that produced them;
+- PERFORMED requires recorded evidence;
+- a `human_gate.action` is valid only on a `GIT_INTEGRATION` gate;
+- READY_FOR_HUMAN_REVIEW requires every declared integration action
+  to be PERFORMED or DECLINED.
 
 The `task_id != parent_task_id` rule is enforced only by the internal
-validator. JSON Schema draft 2020-12 cannot compare one property's
-value against a sibling property's value, and no non-standard schema
-extension is used to imitate that capability.
+validator, as is the rule that a completed Integration Task carries no
+unresolved declared action. JSON Schema draft 2020-12 cannot compare
+one property's value against a sibling property's value, and no
+non-standard schema extension is used to imitate that capability.
 
 If validation rejects a candidate transition:
 
@@ -1076,25 +1214,41 @@ If validation rejects a candidate transition:
 A validation failure is not authorization to manually repair or bypass
 runtime state.
 
-Schema version is `3.0`. It changes only when a genuine runtime
+Schema version is `3.1`. It changes only when a genuine runtime
 data-format migration is separately approved. Stricter enforcement of
 already intended invariants does not by itself require a
-schema-version change.
+schema-version change; `integration_actions` required a version change
+because it is a new required field, not a stricter reading of an
+existing one.
 
 ### Schema migration
 
-The canonical load path accepts schema `3.0` only.
+The canonical load path accepts schema `3.1` only.
 
-A schema-2.0 `status.json` is refused with instructions to migrate. It
-is never silently normalized or auto-upgraded, because an implicit
-upgrade would rewrite the operator's runtime state as a side effect of
-an unrelated command.
+A schema-2.0 or schema-3.0 `status.json` is refused with instructions
+to migrate. It is never silently normalized or auto-upgraded, because
+an implicit upgrade would rewrite the operator's runtime state as a
+side effect of an unrelated command.
 
 Migration is a separate, explicit command:
 
     ./.claude/bin/statusctl migrate-v3 WORK
 
     ./.claude/bin/statusctl migrate-v3 INTEGRATION PARENT_TASK_ID
+
+    ./.claude/bin/statusctl migrate-v31
+
+    ./.claude/bin/statusctl migrate-v31 --action push
+
+Migrating an Integration Task to schema 3.1 requires its remaining
+scope to be declared explicitly. The migration will not invent an
+empty scope, because an empty scope is a claim that no git boundary
+remains — exactly the silent narrowing the field exists to prevent.
+Use `--action none` to state deliberately that none remain.
+
+A gate recorded before action binding existed is carried forward
+naming no action. It stays that way: a migration that assigned it one
+would be manufacturing the approval the binding exists to demand.
 
 The migration path is fail-closed at every step:
 

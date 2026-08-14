@@ -136,6 +136,8 @@ def test_start_integration_rejects_self_parent(
         "start-integration",
         WORK_TASK_ID,
         "Integrate Work Task",
+        "--action",
+        "none",
     )
 
     assert result.returncode != 0
@@ -197,6 +199,8 @@ def test_start_integration_rejects_whitespace_padded_self_parent(
         "start-integration",
         f"  {WORK_TASK_ID}  ",
         "Integrate Work Task",
+        "--action",
+        "none",
     )
 
     assert result.returncode != 0
@@ -230,6 +234,8 @@ def test_start_integration_still_accepts_a_distinct_task_id(
         "start-integration",
         "work-task-integration-001",
         "Integrate Work Task",
+        "--action",
+        "none",
     )
 
     assert result.returncode == 0, (
@@ -314,6 +320,8 @@ def test_migrate_integration_accepts_a_distinct_parent(
         "migrate-v3",
         "INTEGRATION",
         "parent-work-001",
+        "--action",
+        "commit",
     )
 
     assert result.returncode == 0, (
@@ -352,6 +360,8 @@ def test_validator_rejects_self_parent_state(
         "start-integration",
         "work-task-integration-001",
         "Integrate Work Task",
+        "--action",
+        "none",
     ).returncode == 0
 
     module = (
@@ -397,6 +407,8 @@ def test_persisted_self_parent_state_fails_closed(
         "start-integration",
         "work-task-integration-001",
         "Integrate Work Task",
+        "--action",
+        "none",
     ).returncode == 0
 
     status_path = (

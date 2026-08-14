@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "cryptolab-claude-status-v3",
+  "$id": "cryptolab-claude-status-v3-1",
   "title": "CryptoLab Claude Runtime Status",
   "type": "object",
   "additionalProperties": false,
@@ -20,11 +20,12 @@
     "tests",
     "human_gate",
     "last_gate_decision",
+    "integration_actions",
     "report"
   ],
   "properties": {
     "schema_version": {
-      "const": "3.0"
+      "const": "3.1"
     },
     "project": {
       "const": "CryptoLab-DataHub"
@@ -72,6 +73,7 @@
       "enum": [
         null,
         "ANALYZE",
+        "INTEGRATE",
         "IMPLEMENT",
         "TARGETED_TEST",
         "FULL_TEST",
@@ -143,6 +145,20 @@
         },
         {
           "$ref": "#/$defs/gateDecision"
+        }
+      ]
+    },
+    "integration_actions": {
+      "$comment": "The git actions an Integration Task declared at start. Null for IDLE and for a Work Task: a Work Task that carried declared git actions would be integrating, which is the separation Semantics A exists to keep. The rule that READY_FOR_HUMAN_REVIEW requires every entry to be PERFORMED or DECLINED is enforced by the internal validator in .claude/bin/statusctl (validate_state_shape), because expressing it here would require quantifying over array items in a state-dependent way that draft 2020-12 cannot express against a sibling property.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/integrationAction"
+          }
         }
       ]
     },
@@ -257,6 +273,7 @@
           "phase": {
             "enum": [
               "ANALYZE",
+              "INTEGRATE",
               "FINAL_VERIFY"
             ]
           }
@@ -328,7 +345,8 @@
         "recommendation",
         "alternatives",
         "risks",
-        "opened_at"
+        "opened_at",
+        "action"
       ],
       "properties": {
         "gate_id": {
@@ -372,6 +390,79 @@
         "opened_at": {
           "type": "string",
           "format": "date-time"
+        },
+        "action": {
+          "$comment": "The single declared integration action this gate authorizes. Null for every gate type other than GIT_INTEGRATION; the controller additionally requires a GIT_INTEGRATION gate to name one, so that approval to commit is never approval to push.",
+          "enum": [
+            null,
+            "commit",
+            "push",
+            "merge"
+          ]
+        }
+      }
+    },
+    "integrationAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "status",
+        "gate_id",
+        "decided_at",
+        "record",
+        "authorized_head",
+        "evidence"
+      ],
+      "properties": {
+        "action": {
+          "enum": [
+            "commit",
+            "push",
+            "merge"
+          ]
+        },
+        "status": {
+          "$comment": "DECLARED is intended but undecided. AUTHORIZED means a human approved a gate naming exactly this action. PERFORMED means it was carried out and the controller observed evidence. DECLINED means a human rejected it, which is the explicit record that it is not part of this Integration Task's approved scope.",
+          "enum": [
+            "DECLARED",
+            "AUTHORIZED",
+            "PERFORMED",
+            "DECLINED"
+          ]
+        },
+        "gate_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^HG-[0-9]{8}-[0-9]{3,}$"
+        },
+        "decided_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "record": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "authorized_head": {
+          "$comment": "The HEAD observed when the action was authorized, kept so that performing it can be checked against the repository rather than trusted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
