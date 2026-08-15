@@ -1,0 +1,94 @@
+# Hardening 4.4 — one bounded supervisor cycle batch.
+#
+# This is a --user unit, not a system unit. The supervisor drives a
+# developer worktree through the CLAUDE.md lifecycle using that
+# developer's own Claude credentials, so it runs as that person and
+# never as a service account. The other units in this directory are
+# system units for data collection; do not install this one with them.
+#
+# It is timer-activated and carries no [Install] section on purpose,
+# so `systemctl --user enable` has nothing to enable here. Enable
+# cryptolab-supervisor.timer instead. A service that could be enabled
+# in its own right would start at login outside the schedule the timer
+# defines.
+#
+# Paths assume the worktree is at %h/projects/CryptoLab-DataHub-claude.
+# If it lives elsewhere, change WorkingDirectory, ExecCondition and
+# ExecStart together — they must all name the same worktree.
+
+[Unit]
+Description=CryptoLab Autonomous Supervisor Cycle
+
+# No network ordering, deliberately — unlike the system units beside
+# it in this directory, which order after network-online.target and
+# are right to.
+#
+# The worker sessions and the external reviewer are both network
+# calls, so the same line looks obviously correct here too. It is not:
+# network-online.target exists only in the system manager, and a
+# --user unit cannot depend on a system unit. Written here it would
+# resolve to a unit that does not load, so the `Wants=` job would fail
+# on every activation and the `After=` would order against nothing —
+# buying a journal warning per tick in exchange for the guarantee it
+# only appears to give.
+#
+# Nothing is lost by omitting it. OnStartupSec=5min already keeps the
+# first batch away from the login rush, and a batch that does start
+# without a network stops by itself: the supervisor fails
+# EXTERNAL_REVIEW closed rather than reading an unreachable reviewer
+# as an approval.
+
+[Service]
+Type=oneshot
+
+WorkingDirectory=%h/projects/CryptoLab-DataHub-claude
+
+Environment=PYTHONUNBUFFERED=1
+
+# A --user unit inherits almost no PATH. The supervisor invokes
+# `claude` by name, and git by name beneath that, so both must be
+# reachable.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# The reviewer's credential is referenced, never stored. This file
+# lives outside the repository and outside every artifact the run
+# writes, and nothing in this repository creates, reads or populates
+# it — see cryptolab-supervisor.README.md.
+#
+# The leading `-` makes it optional. An absent reviewer must not stop
+# the unit from starting, because the supervisor already has the
+# correct answer for that case: EXTERNAL_REVIEW fails closed rather
+# than being treated as an approval.
+EnvironmentFile=-%h/.config/cryptolab/supervisor.env
+
+# Gate activation on durable runtime state. A timer knows nothing
+# about Human Gates; this does. Exit 1 from the guard skips the unit
+# without failing it, so an open gate costs one journal line per tick
+# instead of a failed unit per tick.
+ExecCondition=%h/projects/CryptoLab-DataHub-claude/deploy/systemd/cryptolab-supervisor-guard
+
+ExecStart=%h/projects/CryptoLab-DataHub-claude/.claude/bin/supervisor run --max-cycles 4
+
+# Never restart. The supervisor is bounded by --max-cycles and
+# resumable from durable state by design, so the next timer tick is
+# the correct way to continue. Restarting would re-enter immediately
+# on exactly the exits that mean "stop and wait" — pinning the
+# orchestrator against the boundary that exists to hold it.
+Restart=no
+
+# 10 is WAITING_FOR_HUMAN and 13 is CONCURRENT. Neither is a fault:
+# the first is the run stopping correctly at a human decision
+# boundary, the second is another orchestrator holding the worktree
+# lock. Recording them as failures would train the operator to ignore
+# a failed unit. 11, 12 and 14 stay failures, because they are.
+SuccessExitStatus=10 13
+
+# A batch of cycles is minutes of model calls, not seconds. The bound
+# is generous but real, so a wedged run cannot hold the worktree
+# forever. Being killed here is recoverable: statusctl transitions are
+# atomic and lock-serialized, and the controller lock is an OS file
+# lock the kernel releases when the process dies.
+TimeoutStartSec=3600
+
+StandardOutput=journal
+StandardError=journal

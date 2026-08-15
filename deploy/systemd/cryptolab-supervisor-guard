@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+
+"""
+Hardening 4.4 — activation guard for the persistent supervisor.
+
+A timer fires on a schedule and knows nothing about the lifecycle it
+is driving. Left alone it would re-activate the supervisor while a
+Human Gate is open, or after the task reached READY_FOR_HUMAN_REVIEW,
+producing a cycle artifact and a failed unit every interval for a
+condition only a person can clear.
+
+This program answers one question from durable runtime state — may a
+supervisor cycle usefully start right now — and answers it as a
+systemd `ExecCondition=`, so the unit is skipped rather than failed
+when the answer is no.
+
+WHAT THIS IS NOT
+================
+
+It never runs the supervisor. That is the whole point of splitting it
+out: `ExecCondition=` and `ExecStart=` are composed by systemd, which
+is configured by an operator, so this program adds no new path to
+`.claude/bin/supervisor`. It reads one file and exits. Running it
+grants exactly what `statusctl show` already grants, which is why it
+needs no permission boundary of its own.
+
+It is also not the safety boundary. The supervisor re-derives the same
+decision under the controller lock immediately before it acts, and
+that check is authoritative. This one runs unlocked and a moment
+earlier, so it can only ever be advisory: at worst a race lets a cycle
+start that the supervisor then stops by itself. The guard exists to
+keep a scheduled unit quiet and honest, not to make it safe.
+
+EXIT CODES
+==========
+
+    0        proceed; systemd runs ExecStart
+    1        skip; systemd marks the unit successful and does nothing
+
+`ExecCondition=` treats 1-254 as "skip, not a failure" and 255 or a
+signal as a genuine failure. Every refusal here stays at 1, including
+the ones that come from an unreadable or unrecognised status file, so
+a broken control plane silently declines to run instead of announcing
+a failure a human has to dismiss on every timer tick.
+
+Fail-closed is the rule throughout: anything this program cannot
+positively confirm is a reason to skip.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+
+PREFIX = "SUPERVISOR_GUARD"
+
+EXIT_PROCEED = 0
+EXIT_SKIP = 1
+
+
+# The only schema this guard can read. A superseded status file means
+# a migration is owed, and migration is an operator-initiated step
+# (CLAUDE.md §5), so the guard declines rather than guessing at fields
+# whose meaning it does not know.
+SUPPORTED_SCHEMA_VERSION = "3.1"
+
+# The one state in which a supervisor cycle has work to do. Every
+# other state is either a human decision boundary (BLOCKED_HUMAN_-
+# DECISION, READY_FOR_HUMAN_REVIEW), or nothing to continue (IDLE,
+# FAILED). Naming the single permitted value rather than enumerating
+# the refusals keeps this stable: a state added to the lifecycle later
+# starts out refused, which is the safe direction.
+RUNNABLE_STATE = "RUNNING"
+
+FAILED_TEST_RESULT = "FAIL"
+
+TEST_KINDS = (
+    "targeted",
+    "full",
+)
+
+
+def status_path_for(root: Path) -> Path:
+    return (
+        root
+        / ".claude"
+        / "runtime"
+        / "status.json"
+    )
+
+
+def decide(root: Path) -> tuple[int, str]:
+    """
+    Whether a supervisor cycle may usefully start, and why.
+
+    Returns the process exit code and a one-line reason for the
+    journal. Reads runtime state and nothing else; writes nothing.
+    """
+
+    status_path = status_path_for(root)
+
+    try:
+        raw = status_path.read_text(
+            encoding="utf-8",
+        )
+
+    except FileNotFoundError:
+        # No runtime file means no task has ever been started here.
+        # `statusctl show` would synthesise IDLE; there is nothing to
+        # continue either way.
+        return (
+            EXIT_SKIP,
+            f"no runtime state at {status_path}",
+        )
+
+    except OSError as error:
+        return (
+            EXIT_SKIP,
+            f"cannot read {status_path}: {error}",
+        )
+
+    try:
+        status = json.loads(raw)
+
+    except json.JSONDecodeError as error:
+        return (
+            EXIT_SKIP,
+            f"runtime state is not valid JSON: {error}",
+        )
+
+    if not isinstance(status, dict):
+        return (
+            EXIT_SKIP,
+            (
+                "runtime state is not a JSON object, got "
+                f"{type(status).__name__}"
+            ),
+        )
+
+    schema_version = status.get("schema_version")
+
+    if schema_version != SUPPORTED_SCHEMA_VERSION:
+        return (
+            EXIT_SKIP,
+            (
+                "runtime schema is "
+                f"{schema_version!r}, this guard reads only "
+                f"{SUPPORTED_SCHEMA_VERSION!r}; an operator "
+                "migration is owed"
+            ),
+        )
+
+    state = status.get("state")
+
+    if state != RUNNABLE_STATE:
+        return (
+            EXIT_SKIP,
+            f"runtime state is {state!r}" + gate_note(status),
+        )
+
+    failed = failed_test_kinds(status)
+
+    if failed:
+        # The supervisor refuses to advance past a recorded FAIL, so
+        # every activation from here would stop on the same evidence.
+        # Skipping keeps the timer quiet until a person looks.
+        return (
+            EXIT_SKIP,
+            (
+                "runtime records a FAILED test requirement ("
+                + ", ".join(failed)
+                + ")"
+            ),
+        )
+
+    return (
+        EXIT_PROCEED,
+        (
+            f"runtime state is {state}, phase "
+            f"{status.get('phase')!r}"
+        ),
+    )
+
+
+def gate_note(status: dict) -> str:
+    """
+    Name the open gate when there is one.
+
+    The gate ID is the thing a human needs in order to resolve it, and
+    it is already published in the report, so surfacing it in the
+    journal costs nothing and saves a lookup.
+    """
+
+    gate = status.get("human_gate")
+
+    if not isinstance(gate, dict):
+        return ""
+
+    gate_id = gate.get("gate_id")
+
+    if not gate_id:
+        return ""
+
+    return f"; Human Gate {gate_id} awaits a human decision"
+
+
+def failed_test_kinds(status: dict) -> list[str]:
+    kinds = []
+
+    tests = status.get("tests")
+
+    if not isinstance(tests, dict):
+        return kinds
+
+    for kind in TEST_KINDS:
+        record = tests.get(kind)
+
+        if (
+            isinstance(record, dict)
+            and record.get("result") == FAILED_TEST_RESULT
+        ):
+            kinds.append(kind)
+
+    return kinds
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) > 2:
+        # Not a usage error worth failing the unit over; the guard's
+        # entire vocabulary is proceed or skip.
+        print(
+            f"{PREFIX} skip: expected at most one argument "
+            "(the worktree root)",
+        )
+
+        return EXIT_SKIP
+
+    if len(argv) == 2:
+        root = Path(argv[1])
+
+    else:
+        # <root>/deploy/systemd/<this file>
+        root = Path(__file__).resolve().parents[2]
+
+    try:
+        code, reason = decide(root)
+
+    except Exception as error:  # noqa: BLE001
+        # Deliberately broad. An unhandled traceback would exit 1 and
+        # skip anyway, but it would do so without saying why, and a
+        # guard that cannot explain itself is worse than one that
+        # simply declines.
+        print(
+            f"{PREFIX} skip: guard failed while reading runtime "
+            f"state: {error!r}",
+        )
+
+        return EXIT_SKIP
+
+    verdict = (
+        "proceed"
+        if code == EXIT_PROCEED
+        else "skip"
+    )
+
+    print(f"{PREFIX} {verdict}: {reason}")
+
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(
+        main(sys.argv)
+    )

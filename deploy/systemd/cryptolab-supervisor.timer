@@ -1,0 +1,38 @@
+# Hardening 4.4 — the schedule that makes the supervisor persistent.
+#
+# This is the unit an operator enables. The service it triggers has no
+# [Install] section, so this timer is the only way the supervisor is
+# started on a schedule.
+
+[Unit]
+Description=Periodic CryptoLab Autonomous Supervisor Cycle
+
+[Timer]
+Unit=cryptolab-supervisor.service
+
+# For a --user timer the user manager starts at login, so OnStartupSec
+# is the analogue of OnBootSec. The delay gives the session time to
+# settle before a batch of model calls begins.
+OnStartupSec=5min
+
+# Measured from when the service last STOPPED, not when it last
+# started. A cycle batch runs for minutes and its duration varies with
+# the work, so a fixed gap after completion is the only interval that
+# stays a real interval. OnUnitActiveSec would fire against a still
+# running unit and, once it finally landed, would leave no gap at all.
+OnUnitInactiveSec=15min
+
+AccuracySec=1min
+
+# Two worktrees on one machine would otherwise contend for the
+# controller lock on the same tick, every tick.
+RandomizedDelaySec=1min
+
+# Deliberately not persistent. A missed cycle has no value to catch
+# up: the next cycle reads the same durable state and does the same
+# work. Catching up would only mean a burst of runs at login, at the
+# moment the machine is least idle.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
