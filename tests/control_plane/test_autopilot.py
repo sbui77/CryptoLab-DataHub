@@ -49,18 +49,6 @@ from typing import Callable
 import pytest
 
 
-PROJECT_ROOT = (
-    Path(__file__).resolve().parents[2]
-)
-
-AUTOPILOT_SOURCE = (
-    PROJECT_ROOT
-    / ".claude"
-    / "bin"
-    / "autopilot"
-)
-
-
 EXIT_OK = 0
 EXIT_WAITING_FOR_HUMAN = 10
 EXIT_BLOCKED_PERMISSION = 11
@@ -72,34 +60,6 @@ EXIT_WAITING_EXTERNAL = 14
 # ================================================================
 # FIXTURES
 # ================================================================
-
-
-@pytest.fixture
-def autopilot_repo(
-    control_plane_repo: Path,
-) -> Path:
-    """
-    The standard isolated control-plane repository, with autopilot
-    installed alongside statusctl.
-    """
-
-    destination = (
-        control_plane_repo
-        / ".claude"
-        / "bin"
-        / "autopilot"
-    )
-
-    shutil.copy2(
-        AUTOPILOT_SOURCE,
-        destination,
-    )
-
-    destination.chmod(
-        0o755
-    )
-
-    return control_plane_repo
 
 
 @pytest.fixture
@@ -1294,6 +1254,19 @@ def test_forbidden_commands_are_refused_by_the_guard(
             "migrate-v3",
             "WORK",
         ],
+        # Every migration spelling, not just the one the guard was
+        # first written against. An exact-name set held `migrate-v3`
+        # and let these two through while refusing the one above.
+        [
+            "./.claude/bin/statusctl",
+            "migrate-v31",
+        ],
+        [
+            "./.claude/bin/statusctl",
+            "migrate-v31",
+            "--action",
+            "push",
+        ],
         [
             "git",
             "commit",
@@ -1631,13 +1604,24 @@ def test_canonical_report_is_the_only_report(
 def default_worker_argv(
     module,
     monkeypatch,
+    session_id: str | None = None,
 ) -> list[str]:
     monkeypatch.delenv(
         "AUTOPILOT_WORKER",
         raising=False,
     )
 
-    return module.worker_argv()
+    # A readable schema file is now part of the worker contract rather
+    # than an option: the orchestrator acts on one field of the reply,
+    # so the reply's shape is pinned at the source. The file is
+    # materialized the same way a real cycle materializes it, because
+    # its contents are what the argv carries — a path that is never
+    # read would prove nothing.
+    with module.worker_schema_file() as schema:
+        return module.worker_argv(
+            schema,
+            session_id,
+        )
 
 
 def flag_value(
@@ -4543,3 +4527,449 @@ def test_shell_wrapper_verification_fails_closed(
     assert status["state"] == "RUNNING"
 
     assert status["completed_at"] is None
+
+
+# ================================================================
+# C1-FIX — --json-schema CARRIES THE SCHEMA, NOT A PATH
+# ================================================================
+#
+# The installed Claude CLI parses the value after --json-schema as a
+# JSON Schema document. Handing it a pathname produced a live failure
+# — "--json-schema is not valid JSON: JSON Parse error: Unrecognized
+# token '/'" — at the moment the session started, which is the worst
+# place for it: the orchestrator had already committed to a cycle.
+#
+# So the file on disk stays the source of truth, and the argv carries
+# what the CLI actually reads. Everything that could make that value
+# wrong is checked before the process is spawned, because structured
+# output is the one thing the run may not silently do without.
+
+
+def json_schema_value(
+    argv: list[str],
+) -> str:
+    value = flag_value(
+        argv,
+        "--json-schema",
+    )
+
+    assert value is not None, (
+        "the worker argv must pin its response shape with "
+        "--json-schema"
+    )
+
+    return value
+
+
+def test_the_json_schema_value_is_the_schema_document(
+    load_autopilot_module,
+    monkeypatch,
+):
+    """
+    C1-FIX: the CLI receives JSON it can parse.
+
+    Not "a path that happens to hold JSON" — the document itself,
+    which is what the flag is defined to take.
+    """
+
+    module = load_autopilot_module()
+
+    argv = default_worker_argv(
+        module,
+        monkeypatch,
+    )
+
+    value = json_schema_value(argv)
+
+    parsed = json.loads(value)
+
+    assert parsed == module.worker_response_schema()
+
+
+def test_the_json_schema_value_is_never_a_pathname(
+    load_autopilot_module,
+    monkeypatch,
+    tmp_path: Path,
+):
+    """
+    C1-FIX: the exact regression that failed live.
+
+    A pathname is refused as the value even when the file it names is
+    a perfectly good schema, because the CLI never reads the file.
+    """
+
+    module = load_autopilot_module()
+
+    schema = tmp_path / module.WORKER_RESPONSE_SCHEMA_FILENAME
+
+    schema.write_text(
+        json.dumps(
+            module.worker_response_schema()
+        )
+    )
+
+    monkeypatch.delenv(
+        "AUTOPILOT_WORKER",
+        raising=False,
+    )
+
+    argv = module.worker_argv(schema)
+
+    value = json_schema_value(argv)
+
+    assert value != str(schema)
+
+    assert not value.startswith("/")
+
+    assert str(schema) not in argv
+
+    assert json.loads(value) == json.loads(
+        schema.read_text()
+    )
+
+
+def test_the_worker_session_schema_reaches_the_argv(
+    load_autopilot_module,
+    monkeypatch,
+):
+    """
+    C1-FIX: the file written for a cycle is the document sent.
+
+    The two must not drift: a schema kept on disk that nothing reads
+    would be documentation, not enforcement.
+    """
+
+    module = load_autopilot_module()
+
+    monkeypatch.delenv(
+        "AUTOPILOT_WORKER",
+        raising=False,
+    )
+
+    with module.worker_session() as (
+        _environment,
+        schema,
+    ):
+        argv = module.worker_argv(schema)
+
+        assert json.loads(
+            json_schema_value(argv)
+        ) == json.loads(
+            schema.read_text()
+        )
+
+
+def test_a_missing_schema_file_stops_the_cycle(
+    load_autopilot_module,
+    monkeypatch,
+    tmp_path: Path,
+):
+    module = load_autopilot_module()
+
+    monkeypatch.delenv(
+        "AUTOPILOT_WORKER",
+        raising=False,
+    )
+
+    with pytest.raises(
+        module.Stop,
+        match="schema",
+    ):
+        module.worker_argv(
+            tmp_path / "absent.schema.json"
+        )
+
+
+def test_an_unparseable_schema_stops_the_cycle(
+    load_autopilot_module,
+    monkeypatch,
+    tmp_path: Path,
+):
+    module = load_autopilot_module()
+
+    schema = tmp_path / "broken.schema.json"
+
+    schema.write_text("{not json")
+
+    monkeypatch.delenv(
+        "AUTOPILOT_WORKER",
+        raising=False,
+    )
+
+    with pytest.raises(
+        module.Stop,
+        match="valid JSON",
+    ):
+        module.worker_argv(schema)
+
+
+def test_a_schema_whose_root_is_not_an_object_stops_the_cycle(
+    load_autopilot_module,
+    monkeypatch,
+    tmp_path: Path,
+):
+    """
+    C1-FIX: a JSON array parses, and pins nothing.
+
+    Fail-closed means refusing a document that cannot constrain a
+    response, not merely one the parser rejects.
+    """
+
+    module = load_autopilot_module()
+
+    schema = tmp_path / "array.schema.json"
+
+    schema.write_text("[]")
+
+    monkeypatch.delenv(
+        "AUTOPILOT_WORKER",
+        raising=False,
+    )
+
+    with pytest.raises(
+        module.Stop,
+        match="object",
+    ):
+        module.worker_argv(schema)
+
+
+def test_an_empty_schema_document_stops_the_cycle(
+    load_autopilot_module,
+    monkeypatch,
+    tmp_path: Path,
+):
+    module = load_autopilot_module()
+
+    schema = tmp_path / "empty.schema.json"
+
+    schema.write_text("{}")
+
+    monkeypatch.delenv(
+        "AUTOPILOT_WORKER",
+        raising=False,
+    )
+
+    with pytest.raises(
+        module.Stop,
+        match="empty",
+    ):
+        module.worker_argv(schema)
+
+
+def test_a_bad_schema_fails_before_the_worker_is_spawned(
+    load_autopilot_module,
+    monkeypatch,
+):
+    """
+    C1-FIX: no subprocess is started on a schema that cannot be sent.
+
+    The live failure cost a whole cycle to discover. Refusing before
+    the spawn keeps a broken schema from consuming the cycle budget,
+    and keeps it from being reported as a worker failure.
+    """
+
+    module = load_autopilot_module()
+
+    monkeypatch.delenv(
+        "AUTOPILOT_WORKER",
+        raising=False,
+    )
+
+    monkeypatch.setattr(
+        module,
+        "worker_response_schema",
+        lambda: ["not", "an", "object"],
+    )
+
+    spawned = []
+
+    def refuse_to_run(*args, **kwargs):
+        spawned.append(args)
+
+        raise AssertionError(
+            "a worker must not be spawned with an unusable schema"
+        )
+
+    monkeypatch.setattr(
+        module,
+        "run_guarded",
+        refuse_to_run,
+    )
+
+    with pytest.raises(module.Stop):
+        module.invoke_worker(
+            {
+                "phase": "IMPLEMENT",
+                "task_id": "t",
+                "task_title": "t",
+                "task_kind": "WORK",
+            },
+            timeout=5.0,
+        )
+
+    assert not spawned
+
+
+def test_the_guard_refuses_a_worker_handed_a_schema_path(
+    load_autopilot_module,
+    tmp_path: Path,
+):
+    """
+    C1-FIX: the guard holds the value, not only the flag.
+
+    An injected or edited worker that reintroduced the pathname would
+    otherwise fail inside the CLI, where the orchestrator can only
+    report it as an opaque worker error.
+    """
+
+    module = load_autopilot_module()
+
+    schema = tmp_path / module.WORKER_RESPONSE_SCHEMA_FILENAME
+
+    schema.write_text(
+        json.dumps(
+            module.worker_response_schema()
+        )
+    )
+
+    argv = [
+        "claude",
+        "--permission-mode",
+        module.WORKER_PERMISSION_MODE,
+        "--allowedTools",
+        "Read",
+        "--disallowedTools",
+        "Bash",
+        "--output-format",
+        module.WORKER_OUTPUT_FORMAT,
+        "--json-schema",
+        str(schema),
+        "-p",
+        "brief",
+    ]
+
+    with pytest.raises(
+        module.ForbiddenCommand,
+        match="--json-schema",
+    ):
+        module.assert_worker_command_allowed(argv)
+
+
+def test_the_guard_accepts_a_worker_handed_the_document(
+    load_autopilot_module,
+    monkeypatch,
+):
+    module = load_autopilot_module()
+
+    argv = [
+        *default_worker_argv(
+            module,
+            monkeypatch,
+        ),
+        "brief",
+    ]
+
+    assert (
+        module.assert_worker_command_allowed(argv)
+        == argv
+    )
+
+
+# A stand-in for the installed CLI, which parses the --json-schema
+# value as a document. The pathname that was passed before reaches it
+# as "/tmp/...", and json.loads reports exactly the live error this
+# fix answers: Unrecognized token '/'.
+CLAUDE_CLI_STUB = """#!/usr/bin/env python3
+import json
+import sys
+
+argv = sys.argv[1:]
+
+if "--json-schema" not in argv:
+    print("Error: --json-schema is required", file=sys.stderr)
+    raise SystemExit(2)
+
+value = argv[argv.index("--json-schema") + 1]
+
+try:
+    document = json.loads(value)
+
+except json.JSONDecodeError as error:
+    print(
+        f"Error: --json-schema is not valid JSON: {error}",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+if not isinstance(document, dict) or "properties" not in document:
+    print(
+        "Error: --json-schema must be a JSON Schema object",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+print(
+    json.dumps(
+        {
+            "result": json.dumps(
+                {
+                    "outcome": "PASS",
+                    "summary": "stub worker",
+                }
+            )
+        }
+    )
+)
+"""
+
+
+def test_a_cli_that_parses_the_flag_accepts_the_real_worker_command(
+    load_autopilot_module,
+    monkeypatch,
+    tmp_path: Path,
+):
+    """
+    C1-FIX: the end of the failure, exercised end to end.
+
+    The stub rejects its argument exactly where the installed CLI
+    rejected it, so this passes only while the value remains something
+    a JSON parser accepts. Nothing is stubbed inside autopilot: the
+    schema is written, read, serialized and spawned the way a real
+    cycle does it.
+    """
+
+    module = load_autopilot_module()
+
+    directory = tmp_path / "cli"
+
+    directory.mkdir()
+
+    stub = directory / "claude"
+
+    stub.write_text(CLAUDE_CLI_STUB)
+
+    stub.chmod(
+        stub.stat().st_mode | stat.S_IEXEC
+    )
+
+    monkeypatch.delenv(
+        "AUTOPILOT_WORKER",
+        raising=False,
+    )
+
+    monkeypatch.setenv(
+        "PATH",
+        str(directory)
+        + os.pathsep
+        + os.environ.get("PATH", ""),
+    )
+
+    outcome = module.invoke_worker(
+        {
+            "phase": "IMPLEMENT",
+        },
+        timeout=60.0,
+        brief="do the phase",
+    )
+
+    assert outcome["outcome"] == "PASS"

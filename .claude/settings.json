@@ -62,6 +62,13 @@
       "Bash(./.claude/bin/statusctl gate alternative *)",
       "Bash(./.claude/bin/statusctl gate reject *)",
 
+      "Bash(./.claude/bin/autopilot)",
+      "Bash(./.claude/bin/autopilot *)",
+      "Bash(./.claude/bin/supervisor)",
+      "Bash(./.claude/bin/supervisor *)",
+      "Bash(./.claude/bin/openai_reviewer)",
+      "Bash(./.claude/bin/openai_reviewer *)",
+
       "Bash(git push --force*)",
       "Bash(git reset --hard *)",
       "Bash(git clean *)",

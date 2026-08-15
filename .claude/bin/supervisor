@@ -1,0 +1,1938 @@
+#!/usr/bin/env python3
+
+"""
+Hardening 4.3 — autonomous supervisor.
+
+The supervisor is autopilot plus the two things an unattended run
+still had to stop for: an independent review it could not perform, and
+an ordinary technical choice it had no way to make.
+
+    autopilot   decides which phase runs next from durable runtime
+                state and drives the transition through statusctl;
+    the worker  performs one phase and reports a structured outcome;
+    the reviewer gives one independent verdict on finished work;
+    the supervisor runs the loop and owns exactly four external
+                states — RUNNING, WAITING_FOR_HUMAN, READY, FAILED.
+
+Every safety property autopilot holds is inherited rather than
+reimplemented: the command guard, the run lock, the read-only worker
+session, the untracked-worktree baseline, the fail-closed parse and
+the rule that statusctl is the only trusted write path. This module
+imports that implementation; it does not copy it.
+
+What it adds:
+
+    EXTERNAL_REVIEW is performed by the reviewer bridge instead of
+      being a stop, and a reviewer that is absent or fails stops the
+      run rather than being skipped;
+
+    a technical choice inside approved scope is auto-selected and
+      recorded as an AUTO_DECISION, so a question that is not a Human
+      Gate never becomes an indefinite wait;
+
+    only a canonical Human Gate — opened through statusctl, with
+      runtime state BLOCKED_HUMAN_DECISION — is reported as
+      WAITING_FOR_HUMAN, the other two human decision boundaries
+      being READY_FOR_HUMAN_REVIEW and a DECLARED integration
+      action, which the lifecycle already names for itself;
+
+    a malformed or non-canonical worker response gets exactly one
+      bounded re-ask and then fails closed;
+
+    one artifact per invocation, including failures, under
+      .claude/var/supervisor/cycles, never under .claude/runtime;
+
+    an Integration Task may record NOT_REQUIRED for a test category
+      only on proven parent evidence, never by task kind.
+
+What it deliberately does not add: any new authority. The supervisor
+opens gates and never resolves one, never migrates the runtime, never
+performs a git integration action, and never records a test result it
+did not produce.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import uuid
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+
+BIN_DIR = Path(__file__).resolve().parent
+
+ROOT = BIN_DIR.parents[1]
+
+
+# The orchestrator and the reviewer are loaded from beside this file
+# rather than imported by package name: `.claude/bin` is not on any
+# import path, and resolving them by location means the supervisor can
+# only ever run against the control plane it is installed in.
+#
+# Bytecode writing is disabled first. These modules live under
+# .claude/, where a stray __pycache__ would be an artifact the control
+# plane never asked for.
+sys.dont_write_bytecode = True
+
+
+def load_sibling(name):
+    path = BIN_DIR / name
+
+    if not path.exists():
+        raise SystemExit(
+            f"supervisor: {name} is missing from {BIN_DIR}. The "
+            "control plane is incomplete."
+        )
+
+    loader = SourceFileLoader(
+        name,
+        str(path),
+    )
+
+    spec = importlib.util.spec_from_loader(
+        name,
+        loader,
+    )
+
+    module = importlib.util.module_from_spec(spec)
+
+    loader.exec_module(module)
+
+    return module
+
+
+autopilot = load_sibling("autopilot")
+
+reviewer = load_sibling("openai_reviewer")
+
+
+Stop = autopilot.Stop
+
+blocked = autopilot.blocked
+
+refused = autopilot.refused
+
+
+# ================================================================
+# EXTERNAL STATES
+# ================================================================
+#
+# The supervisor reports four states and nothing else. Exit codes stay
+# autopilot's, so a caller that needs the finer distinction — a gate
+# versus a missing reviewer versus a technical block — still has it.
+#
+# FAILED here is the supervisor's own external state. It is NOT
+# `statusctl fail`: a technical stop leaves the task RUNNING, because
+# recording a task as FAILED is a judgement about the work, and an
+# orchestrator that made it could close a task it merely could not
+# drive.
+
+STATE_RUNNING = "RUNNING"
+STATE_WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
+STATE_READY = "READY"
+STATE_FAILED = "FAILED"
+
+SUPERVISOR_STATE_BY_RESULT = {
+    "OK": STATE_RUNNING,
+    "READY_FOR_HUMAN_REVIEW": STATE_READY,
+    "WAITING_FOR_HUMAN": STATE_WAITING_FOR_HUMAN,
+    # An external review that cannot be performed is a fault in the
+    # run, not a decision waiting on a person. The contract names
+    # three canonical human decision boundaries — an open Human Gate,
+    # a Work Task at READY_FOR_HUMAN_REVIEW, and an Integration Task
+    # with a DECLARED action — and the supervisor already reports the
+    # second as READY and reaches the third by opening a gate, so
+    # WAITING_FOR_HUMAN is the report for the first and nothing else.
+    # A missing reviewer is none of the three: it opens no gate.
+    # Reporting it as a wait would announce a decision that does not
+    # exist and that no human can resolve, which is the one reading
+    # this supervisor must never produce. So it is FAILED, and
+    # EXIT_WAITING_EXTERNAL still tells it apart from every other
+    # fault for a caller that needs the finer distinction.
+    "WAITING_EXTERNAL": STATE_FAILED,
+    "BLOCKED": STATE_FAILED,
+    "REFUSED": STATE_FAILED,
+    "CONCURRENT": STATE_FAILED,
+}
+
+RESULT_LINE_PREFIX = "SUPERVISOR_RESULT "
+
+
+# ================================================================
+# ARTIFACTS
+# ================================================================
+#
+# Cycle artifacts are working data, not runtime state, and the two are
+# kept physically apart. `.claude/runtime` holds exactly status.json,
+# audit.jsonl and latest_report.md; a regression pins that, and this
+# path is chosen so the invariant is preserved rather than widened.
+
+ARTIFACT_DIR = (
+    ROOT
+    / ".claude"
+    / "var"
+    / "supervisor"
+    / "cycles"
+)
+
+RUNTIME_DIR = (
+    ROOT
+    / ".claude"
+    / "runtime"
+)
+
+AUDIT_PATH = RUNTIME_DIR / "audit.jsonl"
+
+CONTRACT_PATH = ROOT / autopilot.CONTRACT
+
+# How many artifacts to inspect when recovering the most recent
+# external-review verdict. A run that has produced more cycles than
+# this has long since passed the review it is looking for.
+MAX_ARTIFACTS_SCANNED = 200
+
+MAX_HISTORY_ENTRIES = 20
+
+
+# ================================================================
+# WORKER INVOCATION
+# ================================================================
+
+# One re-ask, then fail closed. The bound is the point: a worker that
+# cannot produce a canonical response twice is not going to produce
+# one on the tenth attempt, and an unattended loop that kept asking
+# would burn the cycle budget on the same confusion.
+MAX_WORKER_ATTEMPTS = 2
+
+PREFLIGHT_TIMEOUT_SECONDS = 60.0
+
+PREFLIGHT_REQUIRED_FLAGS = (
+    "--output-format",
+    "--json-schema",
+)
+
+EXTERNAL_REVIEW_PHASE = "EXTERNAL_REVIEW"
+
+# Where an external verdict is worth putting in front of the worker.
+# The findings are the whole point of the phase that follows the
+# review, so they are carried into it rather than left in an artifact
+# nobody reads.
+REVIEW_FEEDBACK_PHASES = {
+    "CORRECT_EXTERNAL_FINDINGS",
+}
+
+REVIEWER_TIMEOUT_SECONDS = 600.0
+
+MAX_DIFF_CHARS = 120_000
+
+# The contract sections a reviewer needs to judge this kind of work.
+# The whole file would bury the relevant rules in twenty-odd sections
+# of runtime mechanics.
+CONTRACT_SECTION_PREFIXES = (
+    "## 10.",
+    "## 11.",
+    "## 12.",
+    "## 13.",
+    "## 17.",
+    "## 20.",
+)
+
+
+def now():
+    return (
+        dt.datetime.now(dt.timezone.utc)
+        .isoformat()
+        .replace(
+            "+00:00",
+            "Z",
+        )
+    )
+
+
+def tail(text, limit=None):
+    limit = (
+        autopilot.WORKER_TAIL_LIMIT
+        if limit is None
+        else limit
+    )
+
+    return str(text or "")[-limit:]
+
+
+# ================================================================
+# DECISION AUTONOMY POLICY
+# ================================================================
+#
+# A worker facing two acceptable implementations is not facing a
+# Human Gate, and an orchestrator that stopped for one would stop
+# constantly for decisions no human wants to be asked about. So a
+# choice inside approved scope is made here and recorded, and the run
+# continues.
+#
+# The boundary is unmoved: gate-worthiness is still decided by
+# CLAUDE.md section 11 and by VALID_GATE_TYPES, an AUTO_DECISION may
+# only settle a choice that triggers no gate, and nothing here can
+# open, resolve, or substitute for a Human Gate.
+
+DECISION_AUTONOMY_POLICY = (
+    "Technical and operational choices inside approved scope are "
+    "decided by the supervisor, not by asking. Return outcome PASS "
+    "having taken the recommended or safest compliant option, or "
+    "request a canonical Human Gate with a valid gate_type, question "
+    "and recommendation. A plain-text question is not a valid "
+    "response."
+)
+
+REFORMULATE_INSTRUCTION = (
+    "Your previous response was not a canonical outcome: it was "
+    "neither PASS nor a Human Gate request carrying a valid "
+    "gate_type, question and recommendation. This is the only "
+    "re-ask. Either complete the phase and return PASS, or return "
+    "HUMAN_GATE_REQUIRED with a gate_type from the contract, a "
+    "question and a recommendation. If the difficulty is a technical "
+    "choice inside approved scope, choose the safest compliant "
+    "option yourself and proceed; that decision is yours to make."
+)
+
+UNPARSEABLE_INSTRUCTION = (
+    "Your previous response could not be parsed as the required "
+    "structured outcome. This is the only re-ask. Reply with exactly "
+    "one JSON object matching the response schema, and nothing after "
+    "it."
+)
+
+
+def auto_decision(response, index):
+    """
+    Settle a non-canonical response that already carries an answer.
+
+    A worker that offers a recommendation has effectively done the
+    analysis and stopped one step short of acting on it. Taking the
+    recommendation is therefore the narrowest possible autonomy: the
+    supervisor contributes no judgement of its own, it declines to
+    treat a decision the worker already made as a question.
+
+    A response that names a gate type is never settled here, however
+    complete the rest of it looks. Naming one is the worker's claim
+    that the choice triggers a Human Gate, and an AUTO_DECISION may
+    only settle a choice that triggers none. Such a response reaches
+    this point only because its request was incomplete — a
+    GIT_INTEGRATION request missing its action, a gate request
+    missing its question — and the answer to an incomplete gate
+    request is to re-ask it, not to overrule the escalation it was
+    asking for by taking the recommendation attached to it.
+
+    Any non-empty gate type disqualifies the response, not merely one
+    this build considers valid. A misspelled or miscased type is
+    still a worker claiming gate-worthiness, and reading that claim
+    as an ordinary technical choice because the spelling failed is
+    the wrong direction to fail.
+
+    Absent a recommendation there is nothing to select. Inventing a
+    choice from alternatives the supervisor cannot evaluate would be
+    the opposite of safe, so it returns None and the worker is asked
+    to reformulate.
+    """
+
+    if str(
+        response.get("gate_type") or ""
+    ).strip():
+        return None
+
+    recommendation = str(
+        response.get("recommendation") or ""
+    ).strip()
+
+    if not recommendation:
+        return None
+
+    alternatives = [
+        str(entry).strip()
+        for entry in (
+            response.get("alternatives") or []
+        )
+        if str(entry).strip()
+    ]
+
+    question = str(
+        response.get("question")
+        or response.get("summary")
+        or ""
+    ).strip()
+
+    return {
+        "id": f"AUTO_DECISION-{index}",
+        "question": question or (
+            "The worker offered a technical choice without "
+            "requesting a Human Gate."
+        ),
+        "options_considered": [
+            recommendation,
+            *alternatives,
+        ],
+        "choice": recommendation,
+        "rationale": (
+            "Decision Autonomy Policy: the response named no "
+            "gate_type at all, so it is a technical or operational "
+            "choice inside approved scope rather than a Human Gate. "
+            "The worker's own recommended option was selected and "
+            "the run continued."
+        ),
+        "decided_at": now(),
+    }
+
+
+def is_canonical_gate_request(response):
+    """
+    Whether a response really asks for a Human Gate.
+
+    Everything a gate needs must be present and consistent. A
+    response that says HUMAN_GATE_REQUIRED but names no valid gate
+    type, or omits the question a human would answer, is a worker
+    that stopped rather than a decision that needs authority — it is
+    re-asked, not escalated.
+    """
+
+    if str(
+        response.get("outcome") or ""
+    ).upper() != "HUMAN_GATE_REQUIRED":
+        return False
+
+    if response.get("gate_type") not in autopilot.VALID_GATE_TYPES:
+        return False
+
+    if not str(
+        response.get("question") or ""
+    ).strip():
+        return False
+
+    if not str(
+        response.get("recommendation") or ""
+    ).strip():
+        return False
+
+    try:
+        autopilot.validated_gate_action(
+            response.get("gate_type"),
+            response.get("action"),
+        )
+
+    except Stop:
+        return False
+
+    return True
+
+
+# ================================================================
+# CYCLE ARTIFACT
+# ================================================================
+
+
+class Cycle:
+    """
+    The record of one supervisor cycle.
+
+    Written once, at the end, whatever the outcome. A cycle that
+    failed is the one most worth reading, so the artifact is produced
+    in a finally rather than on the success path.
+    """
+
+    def __init__(self, runtime, index, kind):
+        self.cycle_id = str(uuid.uuid4())
+
+        self.record = {
+            "cycle_id": self.cycle_id,
+            "cycle_index": index,
+            "kind": kind,
+            "task_id": runtime.get("task_id"),
+            "task_title": runtime.get("task_title"),
+            "task_kind": runtime.get("task_kind"),
+            "parent_task_id": runtime.get("parent_task_id"),
+            "phase": runtime.get("phase"),
+            "started_at": now(),
+            "finished_at": None,
+            "attempts": [],
+            "auto_decisions": [],
+            "review": None,
+            "test_disposition": None,
+            "result": None,
+            "detail": None,
+            "phase_after": None,
+        }
+
+    def attempt(self, number, session_id):
+        entry = {
+            "attempt": number,
+            "session_id": session_id,
+            "started_at": now(),
+            "exit_code": None,
+            "elapsed_seconds": None,
+            "stdout_tail": None,
+            "stderr_tail": None,
+            "outcome": None,
+            "summary": None,
+        }
+
+        self.record["attempts"].append(entry)
+
+        return entry
+
+    def observe(self, entry):
+        """
+        Build the observer autopilot hands the completed process to.
+        """
+
+        def record(completed, elapsed):
+            entry["exit_code"] = completed.returncode
+            entry["elapsed_seconds"] = round(elapsed, 3)
+            entry["stdout_tail"] = tail(completed.stdout)
+            entry["stderr_tail"] = tail(completed.stderr)
+
+        return record
+
+    def finish(self, result, detail, phase_after=None):
+        self.record["result"] = result
+        self.record["detail"] = detail
+        self.record["phase_after"] = phase_after
+        self.record["finished_at"] = now()
+
+    def write(self):
+        """
+        Persist the artifact, failing closed if it cannot be written.
+
+        An unattended run whose own record cannot be kept is a run
+        nobody can review afterwards, so this is a stop rather than a
+        warning nobody reads.
+        """
+
+        try:
+            ARTIFACT_DIR.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            path = ARTIFACT_DIR / f"{self.cycle_id}.json"
+
+            temporary = path.with_suffix(".json.tmp")
+
+            temporary.write_text(
+                json.dumps(
+                    self.record,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+            os.replace(
+                temporary,
+                path,
+            )
+
+        except OSError as error:
+            raise blocked(
+                "Cannot write the supervisor cycle artifact under "
+                f"{ARTIFACT_DIR}: {error}"
+            )
+
+        return path
+
+
+def artifact_records():
+    """
+    Read recent cycle artifacts, newest first.
+
+    Unreadable or malformed files are skipped rather than fatal: an
+    artifact is a record of the past, and one damaged file must not
+    stop a run that is otherwise sound.
+    """
+
+    if not ARTIFACT_DIR.is_dir():
+        return []
+
+    try:
+        stamped = [
+            (
+                path.stat().st_mtime,
+                path,
+            )
+            for path in ARTIFACT_DIR.glob("*.json")
+            if path.is_file()
+        ]
+
+    except OSError:
+        return []
+
+    paths = [
+        path
+        for _, path in sorted(
+            stamped,
+            key=lambda entry: entry[0],
+            reverse=True,
+        )
+    ][:MAX_ARTIFACTS_SCANNED]
+
+    records = []
+
+    for path in paths:
+        try:
+            record = json.loads(path.read_text())
+
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        if isinstance(record, dict):
+            records.append(record)
+
+    return records
+
+
+def latest_review_verdict(task_id):
+    """
+    Recover the most recent external verdict for this task.
+
+    In-memory carry-over would be lost the moment the process
+    restarts, and the phase that consumes the findings has already
+    been advanced into by then. Reading it back from the artifact
+    means a resumed run corrects against the review that actually
+    happened.
+    """
+
+    for record in artifact_records():
+        if record.get("task_id") != task_id:
+            continue
+
+        review = record.get("review")
+
+        if review:
+            return review
+
+    return None
+
+
+def worker_history(task_id):
+    """
+    What the worker reported in earlier cycles of this task.
+
+    The reviewer is judging finished work, and the sequence of phase
+    summaries is the cheapest honest account of how that work was
+    reached.
+    """
+
+    history = []
+
+    for record in artifact_records():
+        if record.get("task_id") != task_id:
+            continue
+
+        for entry in record.get("attempts") or []:
+            if entry.get("outcome") != "PASS":
+                continue
+
+            history.append(
+                {
+                    "phase": record.get("phase"),
+                    "summary": entry.get("summary"),
+                    "at": entry.get("started_at"),
+                }
+            )
+
+    history.sort(
+        key=lambda entry: entry.get("at") or "",
+    )
+
+    return history[-MAX_HISTORY_ENTRIES:]
+
+
+# ================================================================
+# PREFLIGHT
+# ================================================================
+
+
+def preflight_worker_cli(argv):
+    """
+    Refuse to start if the installed CLI cannot honour the posture.
+
+    Structured output is not a convenience here: the orchestrator acts
+    on one field of the worker's answer, and a CLI that rejected
+    --json-schema would leave it parsing prose. The published flag set
+    could not be re-verified when this was designed, so it is verified
+    at startup instead — and an unrecognised flag stops the run with
+    an explicit message rather than silently degrading.
+
+    Only the real Claude CLI is preflighted. An injected worker is a
+    test stub or an operator's own program; holding it to Claude's
+    flag vocabulary would fail for a reason unrelated to the posture.
+    """
+
+    program = Path(str(argv[0])).name
+
+    if program != "claude":
+        return {
+            "checked": False,
+            "reason": (
+                f"Worker program is {program!r}, not the Claude CLI, "
+                "so its flag set is not preflighted."
+            ),
+        }
+
+    try:
+        completed = autopilot.run_guarded(
+            [
+                argv[0],
+                "--help",
+            ],
+            timeout=PREFLIGHT_TIMEOUT_SECONDS,
+        )
+
+    except subprocess.TimeoutExpired:
+        raise blocked(
+            "Worker CLI preflight timed out after "
+            f"{PREFLIGHT_TIMEOUT_SECONDS:.0f}s."
+        )
+
+    except FileNotFoundError:
+        raise blocked(
+            f"Worker CLI {argv[0]!r} is not installed, so no worker "
+            "can be invoked."
+        )
+
+    except autopilot.ForbiddenCommand as error:
+        raise refused(
+            f"Worker CLI preflight refused by the guard: {error}"
+        )
+
+    text = completed.stdout + completed.stderr
+
+    missing = [
+        flag
+        for flag in PREFLIGHT_REQUIRED_FLAGS
+        if flag not in text
+    ]
+
+    if missing:
+        raise blocked(
+            "The installed Claude CLI does not advertise "
+            + " and ".join(missing)
+            + ". The supervisor requires schema-validated structured "
+            "output and will not fall back to parsing prose. Upgrade "
+            "the CLI or configure AUTOPILOT_WORKER with a worker that "
+            "supports it."
+        )
+
+    return {
+        "checked": True,
+        "flags": list(PREFLIGHT_REQUIRED_FLAGS),
+    }
+
+
+# ================================================================
+# BRIEF
+# ================================================================
+
+
+def build_brief(runtime, cycle_id, attempt, guidance, review):
+    """
+    Describe one phase, plus anything the supervisor decided for it.
+
+    autopilot's brief stays the base so there is one description of
+    the phase contract. The supervisor block is additive: the cycle
+    identity, the decision-autonomy rule, any re-ask instruction, and
+    the external verdict when the phase is the one that corrects it.
+    """
+
+    base = json.loads(
+        autopilot.build_brief(runtime)
+    )
+
+    base["supervisor"] = {
+        "cycle_id": cycle_id,
+        "attempt": attempt,
+        "decision_autonomy_policy": DECISION_AUTONOMY_POLICY,
+        "guidance": guidance,
+        "external_review": review,
+    }
+
+    return json.dumps(
+        base,
+        sort_keys=True,
+    )
+
+
+# ================================================================
+# WORKER PHASE
+# ================================================================
+
+
+def perform_worker_phase(runtime, timeout, cycle):
+    """
+    Run one phase to a canonical outcome, or fail closed.
+
+    The loop is bounded at two attempts and every exit from it is
+    explicit: PASS returns, a canonical gate request stops the run at
+    a Human Gate, and anything else is either re-asked once or
+    refused. There is no path here that treats an unclear answer as
+    success.
+    """
+
+    phase = runtime.get("phase")
+
+    review = None
+
+    if phase in REVIEW_FEEDBACK_PHASES:
+        review = latest_review_verdict(
+            runtime.get("task_id")
+        )
+
+    guidance = None
+
+    for attempt in range(1, MAX_WORKER_ATTEMPTS + 1):
+        session_id = str(uuid.uuid4())
+
+        entry = cycle.attempt(
+            attempt,
+            session_id,
+        )
+
+        brief = build_brief(
+            runtime,
+            cycle.cycle_id,
+            attempt,
+            guidance,
+            review,
+        )
+
+        try:
+            response = autopilot.invoke_worker(
+                runtime,
+                timeout,
+                brief=brief,
+                session_id=session_id,
+                observer=cycle.observe(entry),
+            )
+
+        except Stop as stop:
+            if (
+                attempt < MAX_WORKER_ATTEMPTS
+                and stop.extra.get("worker_response_unparseable")
+            ):
+                entry["outcome"] = "UNPARSEABLE"
+                entry["summary"] = stop.detail
+
+                guidance = UNPARSEABLE_INSTRUCTION
+
+                continue
+
+            raise
+
+        outcome = str(
+            response.get("outcome") or ""
+        ).upper()
+
+        summary = str(
+            response.get("summary") or ""
+        ).strip()
+
+        entry["outcome"] = outcome
+        entry["summary"] = summary
+
+        if outcome == "PASS":
+            return response
+
+        if is_canonical_gate_request(response):
+            # Opens the gate through statusctl and stops. Only a
+            # human resolves it, and only this path can produce
+            # WAITING_FOR_HUMAN.
+            autopilot.open_gate(response)
+
+        if attempt >= MAX_WORKER_ATTEMPTS:
+            raise blocked(
+                f"Worker reported outcome {outcome!r} in phase "
+                f"{phase} twice without a canonical result: "
+                + (summary or "no summary given")
+            )
+
+        decision = auto_decision(
+            response,
+            len(cycle.record["auto_decisions"]) + 1,
+        )
+
+        if decision is None:
+            guidance = REFORMULATE_INSTRUCTION
+
+        else:
+            cycle.record["auto_decisions"].append(decision)
+
+            guidance = (
+                "The supervisor applied the Decision Autonomy "
+                "Policy to your previous response and selected your "
+                "own recommended option: "
+                + decision["choice"]
+                + " Proceed on that basis and complete the phase. "
+                "Do not ask again; this is the only re-ask."
+            )
+
+    raise blocked(
+        f"Worker produced no canonical outcome in phase {phase} "
+        f"after {MAX_WORKER_ATTEMPTS} attempts."
+    )
+
+
+# ================================================================
+# EXTERNAL REVIEW
+# ================================================================
+
+
+def reviewer_argv():
+    raw = os.environ.get("SUPERVISOR_REVIEWER")
+
+    if not raw:
+        return None
+
+    try:
+        parsed = json.loads(raw)
+
+    except json.JSONDecodeError as error:
+        raise blocked(
+            f"SUPERVISOR_REVIEWER is not valid JSON: {error}"
+        )
+
+    if (
+        not isinstance(parsed, list)
+        or not parsed
+        or not all(
+            isinstance(token, str)
+            for token in parsed
+        )
+    ):
+        raise blocked(
+            "SUPERVISOR_REVIEWER must be a non-empty JSON array of "
+            "strings."
+        )
+
+    return parsed
+
+
+def reviewer_config():
+    """
+    Resolve reviewer configuration as an orchestrator stop.
+
+    A malformed reviewer setting is a configuration fault the run must
+    stop on, not a traceback, so the bridge's own error is translated
+    into the orchestrator's vocabulary here.
+    """
+
+    try:
+        return reviewer.Config.from_environment()
+
+    except reviewer.ReviewerError as error:
+        raise blocked(
+            f"Reviewer configuration is invalid: {error}"
+        )
+
+
+def reviewer_configured():
+    """
+    Whether an independent review can actually be performed.
+
+    Deliberately a capability question, not a preference: when the
+    answer is no, EXTERNAL_REVIEW stays the stop autopilot already
+    makes it. A missing reviewer never becomes an approval.
+    """
+
+    if reviewer_argv():
+        return True
+
+    return bool(
+        reviewer_config().api_key
+    )
+
+
+def bounded_git_output(argv, description):
+    try:
+        completed = autopilot.run_guarded(
+            argv,
+            timeout=autopilot.STATUSCTL_TIMEOUT_SECONDS,
+        )
+
+    except autopilot.ForbiddenCommand as error:
+        raise refused(
+            f"{description} refused by the guard: {error}"
+        )
+
+    except subprocess.TimeoutExpired:
+        raise blocked(
+            f"{description} timed out while assembling the review "
+            "payload."
+        )
+
+    except FileNotFoundError:
+        raise blocked(
+            f"git is unavailable, so {description.lower()} could not "
+            "be collected for review."
+        )
+
+    if completed.returncode != 0:
+        raise blocked(
+            f"{description} failed: "
+            + (
+                completed.stderr.strip()
+                or completed.stdout.strip()
+                or f"exit {completed.returncode}"
+            )[:400]
+        )
+
+    return completed.stdout
+
+
+def contract_extract():
+    """
+    The contract sections a reviewer needs, not the whole document.
+    """
+
+    try:
+        text = CONTRACT_PATH.read_text()
+
+    except OSError as error:
+        raise blocked(
+            f"Cannot read {autopilot.CONTRACT} for the review "
+            f"payload: {error}"
+        )
+
+    sections = []
+    current = None
+
+    for line in text.splitlines():
+        if line.startswith("## "):
+            keep = line.startswith(
+                CONTRACT_SECTION_PREFIXES
+            )
+
+            current = [] if keep else None
+
+            if keep:
+                sections.append(current)
+
+        if current is not None:
+            current.append(line)
+
+    return "\n".join(
+        "\n".join(section).strip()
+        for section in sections
+    )
+
+
+def review_payload(runtime):
+    """
+    Assemble exactly what the reviewer is allowed to see.
+
+    Worker results, the diff, test evidence, task and phase context,
+    the last Human Gate decision and the contract extract — nothing
+    else. No credentials, no environment, no runtime file contents
+    beyond the state statusctl itself reports.
+
+    The last gate decision is here because EXTERNAL_REVIEW resumes on
+    the same phase a reviewer-proposed gate stopped it at. Without the
+    decision in the payload the reviewer sees the identical evidence
+    that made it ask, has no way to know a human already answered, and
+    can raise the same gate again — a loop a human has to keep
+    resolving with nothing changing between rounds. The record is
+    advisory, as everything the reviewer receives is: it tells the
+    reviewer what was settled and by whom, and the reviewer still
+    judges whether the answer disposes of its concern.
+    """
+
+    diff = bounded_git_output(
+        [
+            "git",
+            "diff",
+            "HEAD",
+        ],
+        "Review diff",
+    )
+
+    truncated = len(diff) > MAX_DIFF_CHARS
+
+    return {
+        "task": {
+            "task_id": runtime.get("task_id"),
+            "task_title": runtime.get("task_title"),
+            "task_kind": runtime.get("task_kind"),
+            "parent_task_id": runtime.get("parent_task_id"),
+            "branch": runtime.get("branch"),
+            "phase": runtime.get("phase"),
+        },
+        "tests": runtime.get("tests"),
+        "integration_actions": runtime.get(
+            "integration_actions"
+        ),
+        "last_gate_decision": runtime.get(
+            "last_gate_decision"
+        ),
+        "worker_history": worker_history(
+            runtime.get("task_id")
+        ),
+        "diff": diff[:MAX_DIFF_CHARS],
+        "diff_truncated": truncated,
+        "diff_stat": bounded_git_output(
+            [
+                "git",
+                "diff",
+                "--stat",
+                "HEAD",
+            ],
+            "Review diff stat",
+        ),
+        "untracked_entries": sorted(
+            autopilot.untracked_entries()
+        ),
+        "contract": autopilot.CONTRACT,
+        "contract_extract": contract_extract(),
+    }
+
+
+def run_reviewer(payload):
+    """
+    Obtain one verdict, from an injected reviewer or the bridge.
+
+    The injected path exists so the whole verdict loop is testable
+    without credentials, and so an operator can substitute a reviewer
+    of their own. Both paths return the same validated verdict shape;
+    neither may write anything.
+    """
+
+    argv = reviewer_argv()
+
+    if argv is None:
+        try:
+            return reviewer.review(payload)
+
+        except reviewer.ReviewerError as error:
+            raise blocked(
+                f"External review failed: {error}"
+            )
+
+    # The payload is handed over as a file rather than an argument:
+    # a diff is far larger than an argument list may safely carry,
+    # and the file lives outside the repository so it never becomes
+    # worktree contamination.
+    with tempfile.TemporaryDirectory(
+        prefix="supervisor-review-",
+    ) as directory:
+        path = Path(directory) / "payload.json"
+
+        path.write_text(
+            json.dumps(
+                payload,
+                sort_keys=True,
+            )
+        )
+
+        try:
+            completed = autopilot.run_guarded(
+                [
+                    *argv,
+                    str(path),
+                ],
+                timeout=REVIEWER_TIMEOUT_SECONDS,
+            )
+
+        except autopilot.ForbiddenCommand as error:
+            raise refused(
+                f"Reviewer command refused by the guard: {error}"
+            )
+
+        except subprocess.TimeoutExpired:
+            raise blocked(
+                "External review timed out after "
+                f"{REVIEWER_TIMEOUT_SECONDS:.0f}s."
+            )
+
+        except FileNotFoundError:
+            raise blocked(
+                f"Reviewer command not found: {argv[0]}"
+            )
+
+    if completed.returncode != 0:
+        raise blocked(
+            "External reviewer exited "
+            f"{completed.returncode}: "
+            + tail(
+                completed.stderr.strip()
+                or completed.stdout.strip(),
+                400,
+            )
+        )
+
+    for line in reversed(completed.stdout.splitlines()):
+        stripped = line.strip()
+
+        if not stripped.startswith("{"):
+            continue
+
+        try:
+            candidate = json.loads(stripped)
+
+        except json.JSONDecodeError:
+            continue
+
+        try:
+            return reviewer.validate_verdict(candidate)
+
+        except reviewer.ReviewerError as error:
+            raise blocked(
+                f"External reviewer returned an invalid verdict: "
+                f"{error}"
+            )
+
+    raise blocked(
+        "External reviewer produced no verdict. Refusing to treat "
+        "unstructured output as approval.",
+        reviewer_stdout_tail=tail(completed.stdout),
+    )
+
+
+def gate_request_from_verdict(verdict):
+    """
+    Turn a HUMAN_DECISION_REQUIRED verdict into a gate request.
+
+    The reviewer supplies the substance; the supervisor opens the
+    gate. GIT_INTEGRATION is refused on the way through — the
+    reviewer's own contract excludes it, and this is the second place
+    that holds, because an integration boundary belongs to a declared
+    Integration Task scope and to the human who approves it.
+    """
+
+    gate_type = verdict.get("gate_type")
+
+    if gate_type in autopilot.INTEGRATION_ONLY_GATE_TYPES:
+        raise blocked(
+            "External reviewer proposed a "
+            f"{gate_type} gate. A reviewer may not request an "
+            "integration authorization."
+        )
+
+    if gate_type not in autopilot.VALID_GATE_TYPES:
+        raise blocked(
+            "External reviewer proposed an invalid gate_type: "
+            f"{gate_type!r}."
+        )
+
+    return {
+        "outcome": "HUMAN_GATE_REQUIRED",
+        "gate_type": gate_type,
+        "action": None,
+        "question": verdict.get("question"),
+        "recommendation": verdict.get("recommendation"),
+        "alternatives": verdict.get("alternatives") or [],
+        "risks": verdict.get("risks") or [],
+    }
+
+
+def perform_external_review(runtime, cycle):
+    """
+    Perform EXTERNAL_REVIEW and decide what it means.
+
+    APPROVE and REQUEST_CHANGES both advance: the phase that follows
+    is where findings are corrected, and the verdict is carried into
+    it. HUMAN_DECISION_REQUIRED opens a canonical Human Gate and
+    stops, because a DISCUSS-class finding is precisely a decision the
+    reviewer may identify and only a human may make.
+    """
+
+    verdict = run_reviewer(
+        review_payload(runtime)
+    )
+
+    cycle.record["review"] = verdict
+
+    if verdict["verdict"] == "HUMAN_DECISION_REQUIRED":
+        autopilot.open_gate(
+            gate_request_from_verdict(verdict)
+        )
+
+    return verdict
+
+
+# ================================================================
+# INTEGRATION TEST DISPOSITION
+# ================================================================
+#
+# An Integration Task integrates work that has already been reviewed
+# and never re-tests product code, so a test record it cannot produce
+# would otherwise strand it short of completion.
+#
+# NOT_REQUIRED is therefore permitted here, and only here, and only on
+# proof. The proof is the parent Work Task's own completion event: a
+# TASK_READY_FOR_HUMAN_REVIEW recorded for exactly that task, as a
+# WORK task, with targeted PASS and full PASS. A parent whose results
+# were themselves NOT_REQUIRED does not qualify — that is what stops
+# one exemption from being inherited down a chain of tasks until
+# nothing was ever tested.
+
+READY_EVENT = "TASK_READY_FOR_HUMAN_REVIEW"
+
+TEST_KINDS = (
+    "targeted",
+    "full",
+)
+
+
+def parent_completion_event(parent_task_id):
+    """
+    Find the parent's most recent completion event.
+
+    Most recent, not most convenient: judging the latest completion
+    and no other means a parent that completed again on weaker
+    evidence cannot be answered with an older, stronger record.
+    """
+
+    if not parent_task_id:
+        return None
+
+    try:
+        lines = AUDIT_PATH.read_text().splitlines()
+
+    except OSError as error:
+        raise blocked(
+            "Cannot read the runtime audit trail at "
+            f"{AUDIT_PATH}: {error}. Integration test disposition "
+            "requires proof, so it fails closed without it."
+        )
+
+    found = None
+
+    for line in lines:
+        stripped = line.strip()
+
+        if not stripped:
+            continue
+
+        try:
+            event = json.loads(stripped)
+
+        except json.JSONDecodeError:
+            continue
+
+        if not isinstance(event, dict):
+            continue
+
+        if event.get("event") != READY_EVENT:
+            continue
+
+        if event.get("task_id") != parent_task_id:
+            continue
+
+        found = event
+
+    return found
+
+
+def assert_parent_evidence(parent_task_id):
+    """
+    Require proof that the parent Work Task really passed.
+
+    Every condition is a separate refusal with its own message,
+    because "the evidence is missing" and "the evidence says
+    something else" are different problems for whoever reads this
+    afterwards.
+
+    A completion event with no task_kind field at all is refused
+    rather than assumed to be WORK. Events recorded before the task
+    model existed carry no kind, and defaulting one would let a task
+    whose kind was never recorded supply evidence about a property
+    nobody wrote down.
+    """
+
+    event = parent_completion_event(parent_task_id)
+
+    if event is None:
+        raise blocked(
+            "No "
+            f"{READY_EVENT} event exists for parent task "
+            f"{parent_task_id!r}, so there is no evidence that the "
+            "work being integrated was ever completed and tested."
+        )
+
+    if "task_kind" not in event:
+        raise blocked(
+            f"The {READY_EVENT} event for parent task "
+            f"{parent_task_id!r} records no task_kind. It predates "
+            "the task model and cannot prove the parent was a Work "
+            "Task."
+        )
+
+    if event.get("task_kind") != "WORK":
+        raise blocked(
+            f"Parent task {parent_task_id!r} completed as "
+            f"{event.get('task_kind')!r}, not WORK. An Integration "
+            "Task may not inherit a test disposition from another "
+            "Integration Task."
+        )
+
+    results = {
+        kind: event.get(f"{kind}_result")
+        for kind in TEST_KINDS
+    }
+
+    weak = [
+        kind
+        for kind in TEST_KINDS
+        if results[kind] != "PASS"
+    ]
+
+    if weak:
+        raise blocked(
+            f"Parent task {parent_task_id!r} completed with "
+            + ", ".join(
+                f"{kind}={results[kind]!r}"
+                for kind in TEST_KINDS
+            )
+            + ". NOT_REQUIRED is permitted only on proven PASS and "
+            "PASS, so the exemption is refused."
+        )
+
+    return event
+
+
+def apply_integration_test_disposition(runtime):
+    """
+    Record NOT_REQUIRED for an Integration Task's empty test slots.
+
+    Only empty slots: an existing result is never overwritten, so a
+    real PASS or a real FAIL recorded earlier stands. A WORK task
+    never reaches this function at all.
+    """
+
+    if runtime.get("task_kind") != "INTEGRATION":
+        return None
+
+    tests = runtime.get("tests") or {}
+
+    empty = [
+        kind
+        for kind in TEST_KINDS
+        if not tests.get(kind)
+    ]
+
+    if not empty:
+        return None
+
+    parent_task_id = runtime.get("parent_task_id")
+
+    event = assert_parent_evidence(parent_task_id)
+
+    reason = (
+        "Integration Task: it integrates already-reviewed work and "
+        "never re-tests product code (CLAUDE.md 2A). Parent Work "
+        f"Task {parent_task_id} recorded {READY_EVENT} at "
+        f"{event.get('timestamp')} with targeted=PASS and "
+        "full=PASS."
+    )
+
+    for kind in empty:
+        autopilot.statusctl_checked(
+            "test-not-required",
+            kind,
+            reason,
+        )
+
+    return {
+        "kinds": empty,
+        "parent_task_id": parent_task_id,
+        "proving_event_timestamp": event.get("timestamp"),
+        "reason": reason,
+    }
+
+
+# ================================================================
+# CYCLE
+# ================================================================
+
+
+def check_can_continue(runtime):
+    """
+    autopilot's own precondition check, minus the one stop the
+    supervisor exists to remove.
+
+    EXTERNAL_REVIEW stops autopilot because it cannot produce the
+    evidence that phase needs. The supervisor can, but only when a
+    reviewer is actually configured — otherwise the stop stands
+    exactly as before.
+    """
+
+    try:
+        autopilot.check_can_continue(runtime)
+
+    except Stop as stop:
+        if (
+            stop.result == "WAITING_EXTERNAL"
+            and runtime.get("phase") == EXTERNAL_REVIEW_PHASE
+            and reviewer_configured()
+        ):
+            return
+
+        raise
+
+
+def complete_task(runtime, baseline, cycle):
+    """
+    Everything that must hold before `ready`, in the order it must.
+
+    The test disposition comes first because it is the one record
+    that can still legitimately be created, and everything after it
+    judges the state it produces. Then fresh verification, then the
+    worktree, then any integration decision still owed, then a report
+    describing all of it.
+    """
+
+    disposition = apply_integration_test_disposition(runtime)
+
+    if disposition is not None:
+        cycle.record["test_disposition"] = disposition
+
+        runtime = autopilot.read_runtime()
+
+    verification = autopilot.run_final_verification(runtime)
+
+    autopilot.assert_completion_preconditions(baseline)
+
+    autopilot.assert_integration_scope_resolved(runtime)
+
+    autopilot.statusctl_checked("report")
+
+    autopilot.statusctl_checked("ready")
+
+    raise Stop(
+        "READY_FOR_HUMAN_REVIEW",
+        autopilot.EXIT_OK,
+        (
+            "Task reached READY_FOR_HUMAN_REVIEW. Integration "
+            "remains a Human Gate."
+        ),
+        verification=verification,
+    )
+
+
+def run_cycle(runtime, timeout, baseline, index):
+    """
+    Perform one phase and advance exactly one step.
+
+    The phase advances only after the phase actually happened, so any
+    failure leaves runtime state where it was and a rerun resumes from
+    the same place.
+    """
+
+    phase = runtime.get("phase")
+    task_id = runtime.get("task_id")
+    observed_at = runtime.get("updated_at")
+
+    is_review = phase == EXTERNAL_REVIEW_PHASE
+
+    cycle = Cycle(
+        runtime,
+        index,
+        "EXTERNAL_REVIEW" if is_review else "WORKER",
+    )
+
+    try:
+        if is_review:
+            verdict = perform_external_review(
+                runtime,
+                cycle,
+            )
+
+            summary = verdict["summary"]
+
+        else:
+            response = perform_worker_phase(
+                runtime,
+                timeout,
+                cycle,
+            )
+
+            summary = str(
+                response.get("summary") or ""
+            ).strip()
+
+            # The worker session cannot reach a writable controller,
+            # so anything that moved runtime state during the cycle
+            # means that isolation did not hold.
+            runtime = autopilot.observe_after_worker(
+                task_id,
+                phase,
+                observed_at,
+            )
+
+            kind = autopilot.VERIFY_PHASES.get(phase)
+
+            if kind is not None:
+                autopilot.run_verification(
+                    kind,
+                    phase,
+                )
+
+                runtime = autopilot.read_runtime()
+
+        following = autopilot.next_phase(runtime)
+
+        if following is None:
+            complete_task(
+                runtime,
+                baseline,
+                cycle,
+            )
+
+        if runtime.get("phase") == autopilot.INTEGRATE_PHASE:
+            autopilot.assert_integration_scope_resolved(runtime)
+
+        autopilot.statusctl_checked(
+            "phase",
+            following,
+        )
+
+        cycle.finish(
+            "PASS",
+            summary,
+            following,
+        )
+
+        return {
+            "phase": following,
+            "summary": summary,
+        }
+
+    except Stop as stop:
+        cycle.finish(
+            stop.result,
+            stop.detail,
+        )
+
+        raise
+
+    finally:
+        cycle.write()
+
+
+def drive(max_cycles, timeout, baseline):
+    """
+    Run cycles until a stop condition or the cycle budget.
+
+    Canonical runtime state is re-read every cycle rather than carried
+    forward in memory: the supervisor keeps no conversational memory,
+    so a fresh process resumes to the same conclusion.
+    """
+
+    runtime = autopilot.read_runtime()
+
+    phase_before = runtime.get("phase")
+
+    completed_cycles = 0
+    last_summary = None
+
+    for index in range(max_cycles):
+        check_can_continue(runtime)
+
+        outcome = run_cycle(
+            runtime,
+            timeout,
+            baseline,
+            index,
+        )
+
+        completed_cycles += 1
+        last_summary = outcome.get("summary")
+
+        runtime = autopilot.read_runtime()
+
+    return {
+        "result": "OK",
+        "exit_code": autopilot.EXIT_OK,
+        "detail": (
+            f"Completed {completed_cycles} cycle(s); the cycle "
+            "budget was reached with work still available."
+        ),
+        "phase_before": phase_before,
+        "runtime": runtime,
+        "cycles": completed_cycles,
+        "worker_summary": last_summary,
+    }
+
+
+# ================================================================
+# OUTPUT
+# ================================================================
+
+
+def emit(payload, exit_code):
+    payload = dict(payload)
+
+    payload["supervisor_state"] = (
+        SUPERVISOR_STATE_BY_RESULT.get(
+            payload.get("result"),
+            STATE_FAILED,
+        )
+    )
+
+    print(
+        RESULT_LINE_PREFIX
+        + json.dumps(
+            payload,
+            sort_keys=True,
+        )
+    )
+
+    return exit_code
+
+
+# ================================================================
+# COMMANDS
+# ================================================================
+
+
+def cmd_run(args):
+    timeout = autopilot.positive_float(
+        "AUTOPILOT_TIMEOUT",
+        autopilot.DEFAULT_WORKER_TIMEOUT_SECONDS,
+    )
+
+    # Taken before any work begins, so it describes the worktree the
+    # supervisor inherited rather than the one it produced.
+    baseline = autopilot.untracked_entries()
+
+    runtime = autopilot.read_runtime()
+
+    phase_before = runtime.get("phase")
+
+    try:
+        # Resolved once, at startup, from the same function the
+        # cycles use, so the program preflighted is the program that
+        # will actually run. The schema is materialized the way a
+        # cycle materializes it and the argv carries the document
+        # itself, exactly as a cycle's does: a stand-in value here
+        # could stay acceptable while the real one had stopped being
+        # sendable, which is precisely the failure this preflight is
+        # supposed to catch before a cycle is spent on it.
+        with autopilot.worker_schema_file() as schema:
+            preflight_worker_cli(
+                autopilot.worker_argv(schema)
+            )
+
+        finished = drive(
+            args.max_cycles,
+            timeout,
+            baseline,
+        )
+
+    except Stop as stop:
+        runtime = autopilot.read_runtime()
+
+        payload = autopilot.payload_from_runtime(
+            runtime,
+            phase_before,
+        )
+
+        payload.update(
+            {
+                "result": stop.result,
+                "exit_code": stop.exit_code,
+                "detail": stop.detail,
+            }
+        )
+
+        payload.update(stop.extra)
+
+        return emit(
+            payload,
+            stop.exit_code,
+        )
+
+    payload = autopilot.payload_from_runtime(
+        finished["runtime"],
+        finished["phase_before"],
+    )
+
+    payload.update(
+        {
+            "result": finished["result"],
+            "exit_code": finished["exit_code"],
+            "detail": finished["detail"],
+            "cycles": finished["cycles"],
+            "worker_summary": finished["worker_summary"],
+        }
+    )
+
+    return emit(
+        payload,
+        finished["exit_code"],
+    )
+
+
+def cmd_status(_):
+    """
+    Report what the supervisor would do next, changing nothing.
+    """
+
+    runtime = autopilot.read_runtime()
+
+    payload = autopilot.payload_from_runtime(
+        runtime,
+        runtime.get("phase"),
+    )
+
+    payload.update(
+        {
+            "result": "OK",
+            "exit_code": autopilot.EXIT_OK,
+            "human_gate": runtime.get("human_gate"),
+            "tests": runtime.get("tests"),
+            "report": runtime.get("report"),
+            "reviewer": reviewer_config().describe(),
+            "reviewer_configured": reviewer_configured(),
+            "artifacts": str(ARTIFACT_DIR),
+        }
+    )
+
+    try:
+        check_can_continue(runtime)
+
+    except Stop as stop:
+        payload["detail"] = stop.detail
+        payload["next_action"] = stop.result
+
+    else:
+        payload["detail"] = (
+            "Supervisor would run phase "
+            f"{runtime.get('phase')}."
+        )
+
+        payload["next_action"] = "RUN"
+
+    return emit(
+        payload,
+        autopilot.EXIT_OK,
+    )
+
+
+def main():
+    # A worker session is deliberately unable to change lifecycle
+    # state. Letting it drive a supervisor run would hand back
+    # everything that restriction takes away.
+    if os.environ.get(autopilot.WORKER_SESSION_MARKER):
+        raise SystemExit(
+            emit(
+                {
+                    "result": "REFUSED",
+                    "exit_code": autopilot.EXIT_BLOCKED_PERMISSION,
+                    "detail": (
+                        "Refusing to run inside a worker session. A "
+                        "worker reports its outcome; it does not "
+                        "orchestrate."
+                    ),
+                },
+                autopilot.EXIT_BLOCKED_PERMISSION,
+            )
+        )
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "CryptoLab autonomous supervisor: autopilot plus an "
+            "independent reviewer and bounded decision autonomy."
+        )
+    )
+
+    sub = parser.add_subparsers(
+        dest="cmd",
+        required=True,
+    )
+
+    for name in (
+        "run",
+        "resume",
+    ):
+        command = sub.add_parser(name)
+
+        command.add_argument(
+            "--max-cycles",
+            type=int,
+            default=autopilot.DEFAULT_MAX_CYCLES,
+        )
+
+        command.set_defaults(func=cmd_run)
+
+    command = sub.add_parser("status")
+    command.set_defaults(func=cmd_status)
+
+    args = parser.parse_args()
+
+    if getattr(args, "max_cycles", 1) < 1:
+        raise SystemExit(
+            "--max-cycles must be at least 1."
+        )
+
+    try:
+        # `status` is read-only and deliberately lock-free, so
+        # inspecting a running worktree never contends with the run
+        # it inspects.
+        if args.func is cmd_status:
+            raise SystemExit(
+                args.func(args)
+            )
+
+        # The same lock autopilot takes, on purpose: two
+        # orchestrators driving one worktree is the failure this
+        # prevents, and it does not matter which two.
+        with autopilot.autopilot_lock(ROOT):
+            raise SystemExit(
+                args.func(args)
+            )
+
+    except autopilot.ConcurrentRun as error:
+        raise SystemExit(
+            emit(
+                {
+                    "result": "CONCURRENT",
+                    "exit_code": autopilot.EXIT_CONCURRENT,
+                    "detail": str(error),
+                },
+                autopilot.EXIT_CONCURRENT,
+            )
+        )
+
+    except autopilot.ForbiddenCommand as error:
+        raise SystemExit(
+            emit(
+                {
+                    "result": "REFUSED",
+                    "exit_code": autopilot.EXIT_BLOCKED_PERMISSION,
+                    "detail": str(error),
+                },
+                autopilot.EXIT_BLOCKED_PERMISSION,
+            )
+        )
+
+    except Stop as stop:
+        payload = {
+            "result": stop.result,
+            "exit_code": stop.exit_code,
+            "detail": stop.detail,
+        }
+
+        payload.update(stop.extra)
+
+        raise SystemExit(
+            emit(
+                payload,
+                stop.exit_code,
+            )
+        )
+
+
+if __name__ == "__main__":
+    main()

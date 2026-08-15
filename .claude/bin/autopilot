@@ -214,6 +214,8 @@ FINAL_VERIFICATION_KINDS = (
 
 WORKER_PERMISSION_MODE = "dontAsk"
 
+WORKER_OUTPUT_FORMAT = "json"
+
 WORKER_ALLOWED_TOOLS = (
     "Read",
     "Glob",
@@ -253,19 +255,273 @@ WORKER_DISALLOWED_TOOLS = (
     "Bash(./.claude/bin/statusctl migrate-v31)",
     "Bash(./.claude/bin/statusctl migrate-v31 *)",
     "Bash(statusctl *)",
+    # Orchestrators, for the same reason: a worker reports its
+    # outcome, it does not drive the lifecycle. The session marker
+    # already refuses a nested run and the guard already refuses these
+    # programs by name; this is the third layer, stated where the
+    # session's own capability list can see it.
+    "Bash(./.claude/bin/autopilot)",
+    "Bash(./.claude/bin/autopilot *)",
+    "Bash(./.claude/bin/supervisor)",
+    "Bash(./.claude/bin/supervisor *)",
+    "Bash(./.claude/bin/openai_reviewer)",
+    "Bash(./.claude/bin/openai_reviewer *)",
 )
 
 
-def default_worker_argv():
+# ================================================================
+# WORKER RESPONSE SCHEMA
+# ================================================================
+#
+# The worker's verdict is the one thing autopilot reads back out of a
+# session it otherwise cannot trust, so its shape is pinned rather
+# than hoped for. Serializing this document into the --json-schema
+# value makes the model's final message schema-validated at the
+# source; the fail-closed parse below stays regardless, because a
+# schema the CLI enforces is still only as good as the CLI honouring
+# it.
+#
+# The CLI reads that value as the schema itself, not as a path to one.
+# A cycle still writes the schema to a file — it is what the worker
+# session is described by, and what a failed run can be read back
+# from — but the file is the source of truth, never the argument.
+# Handing over the pathname made the CLI parse "/" as JSON and fail at
+# the moment the session started, after the cycle was already spent.
+#
+# The field set is deliberately identical to the response_schema
+# described in the brief. Two descriptions of one contract that can
+# drift apart are worse than one, so the brief renders from here.
+
+WORKER_RESPONSE_SCHEMA_FILENAME = "worker_response.schema.json"
+
+WORKER_RESPONSE_FIELD_DOC = {
+    "outcome": "PASS | HUMAN_GATE_REQUIRED | BLOCKED",
+    "summary": "one line describing what was done",
+    "gate_type": (
+        "required when outcome is HUMAN_GATE_REQUIRED"
+    ),
+    "action": (
+        "required when gate_type is GIT_INTEGRATION: the single "
+        "declared integration action the gate authorizes (commit, "
+        "push or merge). Approval to commit is not approval to push."
+    ),
+    "question": (
+        "required when outcome is HUMAN_GATE_REQUIRED"
+    ),
+    "recommendation": (
+        "required when outcome is HUMAN_GATE_REQUIRED"
+    ),
+    "alternatives": "optional list of strings",
+    "risks": "optional list of strings",
+}
+
+
+def worker_response_schema():
+    """
+    The JSON Schema whose serialization is the --json-schema value.
+
+    `outcome` and `summary` are the only required properties: a
+    HUMAN_GATE_REQUIRED response needs more, but a schema that
+    demanded gate fields unconditionally would make an ordinary PASS
+    unrepresentable. The conditional requirements are enforced where
+    they are acted on — open_gate refuses a gate request missing its
+    question or recommendation, and validated_gate_action refuses an
+    integration gate that names no action.
+    """
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "outcome",
+            "summary",
+        ],
+        "properties": {
+            "outcome": {
+                "type": "string",
+                "enum": [
+                    "PASS",
+                    "HUMAN_GATE_REQUIRED",
+                    "BLOCKED",
+                ],
+                "description": (
+                    WORKER_RESPONSE_FIELD_DOC["outcome"]
+                ),
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    WORKER_RESPONSE_FIELD_DOC["summary"]
+                ),
+            },
+            "gate_type": {
+                "type": [
+                    "string",
+                    "null",
+                ],
+                "enum": [
+                    *sorted(VALID_GATE_TYPES),
+                    None,
+                ],
+                "description": (
+                    WORKER_RESPONSE_FIELD_DOC["gate_type"]
+                ),
+            },
+            "action": {
+                "type": [
+                    "string",
+                    "null",
+                ],
+                "enum": [
+                    *sorted(INTEGRATION_ACTIONS),
+                    None,
+                ],
+                "description": (
+                    WORKER_RESPONSE_FIELD_DOC["action"]
+                ),
+            },
+            "question": {
+                "type": [
+                    "string",
+                    "null",
+                ],
+                "description": (
+                    WORKER_RESPONSE_FIELD_DOC["question"]
+                ),
+            },
+            "recommendation": {
+                "type": [
+                    "string",
+                    "null",
+                ],
+                "description": (
+                    WORKER_RESPONSE_FIELD_DOC["recommendation"]
+                ),
+            },
+            "alternatives": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                },
+                "description": (
+                    WORKER_RESPONSE_FIELD_DOC["alternatives"]
+                ),
+            },
+            "risks": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                },
+                "description": (
+                    WORKER_RESPONSE_FIELD_DOC["risks"]
+                ),
+            },
+        },
+    }
+
+
+def worker_schema_argument(schema_path):
+    """
+    Read the schema file and return the value the CLI expects.
+
+    The file stays the source of truth and the argument is derived
+    from it, so there is no second copy of the schema to drift. Every
+    way that derivation can fail is checked here, before argv is
+    built: a schema that cannot be sent is a cycle that cannot ask for
+    structured output, and unstructured output is not a degraded mode
+    this orchestrator has.
+
+    An empty object is refused along with the unparseable ones. It is
+    valid JSON and constrains nothing, which is the same as sending no
+    schema at all — the difference being that it would look like the
+    posture was intact.
+    """
+
+    if not schema_path:
+        raise blocked(
+            "A worker command needs a response schema path. "
+            "Structured output is not optional."
+        )
+
+    path = Path(schema_path)
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+
+    except OSError as error:
+        raise blocked(
+            f"Worker response schema at {path} cannot be read: "
+            f"{error}"
+        )
+
+    try:
+        document = json.loads(raw)
+
+    except json.JSONDecodeError as error:
+        raise blocked(
+            f"Worker response schema at {path} is not valid JSON: "
+            f"{error}"
+        )
+
+    if not isinstance(document, dict):
+        raise blocked(
+            f"Worker response schema at {path} must be a JSON "
+            f"object, got {type(document).__name__}."
+        )
+
+    if not document:
+        raise blocked(
+            f"Worker response schema at {path} is empty, so it pins "
+            "nothing. A worker is not asked for structured output "
+            "under a schema that does not constrain it."
+        )
+
+    serialized = json.dumps(
+        document,
+        sort_keys=True,
+    )
+
+    # The last check on the value actually sent. A non-empty object
+    # cannot serialize to nothing, so this is the invariant restated
+    # where it is relied on rather than a case seen in the wild — the
+    # argument is what the CLI parses, and it is checked as such.
+    if not serialized.strip():
+        raise blocked(
+            f"Worker response schema at {path} serialized to "
+            "nothing."
+        )
+
+    return serialized
+
+
+def default_worker_argv(schema_path, session_id=None):
     """
     The real worker: one Claude session, explicitly constrained.
+
+    Structured output is part of the posture rather than a
+    convenience. An unattended orchestrator that parsed prose would be
+    guessing at the one value it acts on, so the session is asked for
+    JSON against an inline schema and the guard below refuses a worker
+    that drops either flag.
+
+    --json-schema carries the schema document, never the path to it.
+    The CLI parses that value as JSON, so a pathname fails inside the
+    session rather than here, where it can be explained.
+
+    A session id, when the caller supplies one, names a NEW session
+    per invocation and is never paired with --resume. Bounded turns
+    come from the orchestrator — a timeout and a cycle budget — and a
+    session that carried conversation forward would quietly reintroduce
+    the unbounded loop those bounds exist to prevent.
 
     The prompt is appended by the caller, so `-p` is deliberately last
     — a variadic option such as --disallowedTools would otherwise
     swallow the brief that follows it.
     """
 
-    return [
+    schema = worker_schema_argument(schema_path)
+
+    argv = [
         "claude",
         "--permission-mode",
         WORKER_PERMISSION_MODE,
@@ -273,8 +529,23 @@ def default_worker_argv():
         ",".join(WORKER_ALLOWED_TOOLS),
         "--disallowedTools",
         ",".join(WORKER_DISALLOWED_TOOLS),
-        "-p",
+        "--output-format",
+        WORKER_OUTPUT_FORMAT,
+        "--json-schema",
+        schema,
     ]
+
+    if session_id:
+        argv.extend(
+            [
+                "--session-id",
+                str(session_id),
+            ]
+        )
+
+    argv.append("-p")
+
+    return argv
 
 
 # ================================================================
@@ -292,6 +563,18 @@ def default_worker_argv():
 # task it is working on; it cannot change it.
 
 WORKER_SESSION_MARKER = "AUTOPILOT_WORKER_SESSION"
+
+# Environment a worker session never sees. Orchestrator configuration
+# is withheld because a worker that could read AUTOPILOT_WORKER or
+# SUPERVISOR_REVIEWER could also learn how to become one. OPENAI_ is
+# withheld for a different reason: the reviewer's credential belongs to
+# the reviewer, and a session with Bash in its allowlist has no
+# business inheriting a key it never needs.
+WORKER_STRIPPED_ENVIRONMENT_PREFIXES = (
+    "AUTOPILOT_",
+    "SUPERVISOR_",
+    "OPENAI_",
+)
 
 WORKER_READ_ONLY_STATUSCTL_COMMANDS = (
     "show",
@@ -364,6 +647,16 @@ FORBIDDEN_PROGRAMS = {
     "sudo",
     "su",
     "doas",
+}
+
+# The control plane's own orchestrators. A worker that could invoke
+# one of these would be handing itself back every authority the worker
+# session exists to withhold, so they are refused by name wherever a
+# worker command is resolved.
+ORCHESTRATOR_PROGRAMS = {
+    "autopilot",
+    "supervisor",
+    "openai_reviewer",
 }
 
 # Every command autopilot runs is argv-only, so no runtime value can
@@ -459,9 +752,16 @@ FORBIDDEN_STATUSCTL_GATE_ACTIONS = {
 
 # Operator authority. Migration rewrites the operator's canonical
 # runtime state, so it is never autonomous.
-FORBIDDEN_STATUSCTL_COMMANDS = {
-    "migrate-v3",
-}
+#
+# Matched by prefix rather than by exact name, because the exact
+# names are what failed: the set held `migrate-v3` and so let
+# `migrate-v31` through, the same prefix trap the worker denylist in
+# .claude/settings.json already documents. Every migration subcommand
+# is operator-initiated by CLAUDE.md section 5, so the guard refuses
+# the family instead of the members that happen to exist today.
+FORBIDDEN_STATUSCTL_COMMAND_PREFIXES = (
+    "migrate",
+)
 
 # Git is allowlisted rather than denylisted: an integration or
 # destructive subcommand that nobody thought to enumerate must fail
@@ -541,7 +841,9 @@ def assert_command_allowed(argv):
             )
 
     if program == "statusctl":
-        if rest[:1] and rest[0] in FORBIDDEN_STATUSCTL_COMMANDS:
+        if rest[:1] and rest[0].startswith(
+            FORBIDDEN_STATUSCTL_COMMAND_PREFIXES
+        ):
             raise ForbiddenCommand(
                 f"statusctl {rest[0]} is operator-initiated and "
                 "must never be run autonomously."
@@ -607,9 +909,10 @@ def assert_worker_command_allowed(argv):
 
     program = Path(str(argv[0])).name
 
-    if program == "autopilot":
+    if program in ORCHESTRATOR_PROGRAMS:
         raise ForbiddenCommand(
-            "Refusing a worker that re-enters autopilot."
+            f"Refusing a worker that re-enters {program}. A worker "
+            "reports its outcome; it does not orchestrate."
         )
 
     if program != "claude":
@@ -642,6 +945,58 @@ def assert_worker_command_allowed(argv):
         raise ForbiddenCommand(
             "A claude worker must deny lifecycle-changing "
             "capabilities with --disallowedTools."
+        )
+
+    # Structured output is enforced on the resolved argv, not only on
+    # the default. Without this an injected worker could quietly drop
+    # the flags and hand back prose, which the orchestrator would then
+    # have to guess at — and a guess about the one field that decides
+    # whether a phase advances is not a guess worth making.
+    output_format = flag_value(
+        argv,
+        "--output-format",
+    )
+
+    if output_format != WORKER_OUTPUT_FORMAT:
+        raise ForbiddenCommand(
+            "A claude worker must return structured output with "
+            f"--output-format {WORKER_OUTPUT_FORMAT}, got "
+            f"{output_format!r}."
+        )
+
+    schema = flag_value(
+        argv,
+        "--json-schema",
+    )
+
+    if not schema:
+        raise ForbiddenCommand(
+            "A claude worker must pin its response shape with "
+            "--json-schema."
+        )
+
+    # The value, not just the flag. The CLI parses it as a schema
+    # document, so a pathname — the mistake this guard exists to
+    # catch — would be rejected inside the session, where the
+    # orchestrator can only report it as an opaque worker failure.
+    try:
+        document = json.loads(schema)
+
+    except json.JSONDecodeError as error:
+        # The rejected value is quoted back bounded, because it is
+        # attacker- or operator-supplied text that ends up in an error
+        # a cycle artifact may carry, and artifacts carry tails rather
+        # than whole payloads.
+        raise ForbiddenCommand(
+            "A claude worker must pass the schema document itself "
+            "to --json-schema, not "
+            f"{schema[:WORKER_TAIL_LIMIT]!r}: {error}"
+        )
+
+    if not isinstance(document, dict) or not document:
+        raise ForbiddenCommand(
+            "A claude worker's --json-schema value must be a "
+            "non-empty JSON object."
         )
 
     return argv
@@ -898,18 +1253,31 @@ def read_runtime():
 # ================================================================
 
 
-def worker_argv():
+def worker_argv(schema_path, session_id=None):
     """
     Resolve the worker command.
 
+    `schema_path` names a file the caller has already written; the
+    real worker reads it and sends its contents, so the path must be
+    readable here rather than merely well-formed.
+
     The worker is injectable so that the orchestrator can be tested
-    without credentials, a network, or a real Claude session.
+    without credentials, a network, or a real Claude session. An
+    injected worker is passed no session id: session identity is a
+    Claude CLI concept, and a stub told to accept a flag it does not
+    understand would fail for a reason that has nothing to do with the
+    property under test. It is passed no schema either — the schema is
+    the Claude CLI's way of pinning a reply, and the fail-closed parse
+    of that reply is what holds for every worker.
     """
 
     raw = os.environ.get("AUTOPILOT_WORKER")
 
     if not raw:
-        return default_worker_argv()
+        return default_worker_argv(
+            schema_path,
+            session_id,
+        )
 
     try:
         parsed = json.loads(raw)
@@ -984,43 +1352,118 @@ def build_brief(runtime):
                 "not perform any gated action. Reply with one "
                 "final line of JSON."
             ),
-            "response_schema": {
-                "outcome": (
-                    "PASS | HUMAN_GATE_REQUIRED | BLOCKED"
-                ),
-                "summary": "one line describing what was done",
-                "gate_type": (
-                    "required when outcome is HUMAN_GATE_REQUIRED"
-                ),
-                "action": (
-                    "required when gate_type is GIT_INTEGRATION: "
-                    "the single declared integration action the "
-                    "gate authorizes (commit, push or merge). "
-                    "Approval to commit is not approval to push."
-                ),
-                "question": (
-                    "required when outcome is HUMAN_GATE_REQUIRED"
-                ),
-                "recommendation": (
-                    "required when outcome is HUMAN_GATE_REQUIRED"
-                ),
-                "alternatives": "optional list of strings",
-                "risks": "optional list of strings",
-            },
+            "response_schema": dict(
+                WORKER_RESPONSE_FIELD_DOC
+            ),
         },
         sort_keys=True,
     )
+
+
+# `--output-format json` wraps the session's final message in a
+# transport envelope. The field carrying that message is named
+# differently across CLI versions, and the orchestrator cannot verify
+# which one it will meet, so every plausible carrier is unwrapped
+# rather than one being assumed. An envelope shape nobody anticipated
+# still fails closed through the line scan below it.
+WORKER_ENVELOPE_CONTENT_KEYS = (
+    "structured_output",
+    "structuredOutput",
+    "result",
+    "output",
+    "content",
+    "text",
+    "response",
+)
+
+# Envelopes nest, but not deeply. The bound exists so a self-
+# referential or pathological payload cannot spin here.
+MAX_ENVELOPE_DEPTH = 6
+
+WORKER_TAIL_LIMIT = 2000
+
+
+def unwrap_worker_outcome(candidate, depth=0):
+    """
+    Find the worker's outcome object inside whatever wraps it.
+
+    A dict carrying "outcome" is the verdict itself. Anything else is
+    treated as a possible envelope: each known content key is followed,
+    and a string is re-parsed as JSON, because the CLI delivers the
+    final message as text even when that text is itself JSON.
+
+    Returns None rather than raising. The caller decides what an
+    absent outcome means, and it always means failure.
+    """
+
+    if depth > MAX_ENVELOPE_DEPTH:
+        return None
+
+    if isinstance(candidate, str):
+        stripped = candidate.strip()
+
+        if not stripped.startswith("{"):
+            return None
+
+        try:
+            return unwrap_worker_outcome(
+                json.loads(stripped),
+                depth + 1,
+            )
+
+        except json.JSONDecodeError:
+            return None
+
+    if not isinstance(candidate, dict):
+        return None
+
+    if "outcome" in candidate:
+        return candidate
+
+    for key in WORKER_ENVELOPE_CONTENT_KEYS:
+        if key not in candidate:
+            continue
+
+        found = unwrap_worker_outcome(
+            candidate[key],
+            depth + 1,
+        )
+
+        if found is not None:
+            return found
+
+    return None
 
 
 def parse_worker_response(stdout):
     """
     Extract the worker's structured outcome, failing closed.
 
-    Scanning backwards for the last JSON object carrying an "outcome"
-    lets a conversational worker narrate freely before its verdict.
+    Two shapes are accepted, in the order a real session produces
+    them. First the whole of stdout as one JSON document, which is
+    what `--output-format json` emits; the verdict is unwrapped from
+    the envelope. Then, as a fallback, a backwards line scan, which
+    lets a conversational worker narrate freely before its verdict and
+    keeps every injected stub working unchanged.
+
     Output that contains no such object is a failure, never a silent
     success: an unparseable worker must not be read as approval.
     """
+
+    whole = stdout.strip()
+
+    if whole.startswith("{"):
+        try:
+            envelope = json.loads(whole)
+
+        except json.JSONDecodeError:
+            envelope = None
+
+        if envelope is not None:
+            found = unwrap_worker_outcome(envelope)
+
+            if found is not None:
+                return found
 
     for line in reversed(stdout.splitlines()):
         stripped = line.strip()
@@ -1034,16 +1477,21 @@ def parse_worker_response(stdout):
         except json.JSONDecodeError:
             continue
 
-        if (
-            isinstance(candidate, dict)
-            and "outcome" in candidate
-        ):
-            return candidate
+        found = unwrap_worker_outcome(candidate)
+
+        if found is not None:
+            return found
 
     raise blocked(
         "Worker produced no parseable outcome. Refusing to treat "
         "unstructured output as success.",
-        worker_stdout_tail=stdout[-500:],
+        # Named so a caller can tell "the worker said nothing I can
+        # read" from every other kind of block. It is the one worker
+        # failure a bounded re-ask can plausibly fix, and a supervisor
+        # that re-asked on all of them would retry timeouts and
+        # refusals too.
+        worker_response_unparseable=True,
+        worker_stdout_tail=stdout[-WORKER_TAIL_LIMIT:],
     )
 
 
@@ -1051,19 +1499,21 @@ def worker_environment(shim):
     """
     Build the environment the worker session runs in.
 
-    Two things are removed and one is added. Autopilot's own
-    configuration goes, so a worker cannot read the orchestrator's
-    settings or relaunch it with a worker of its choosing. The
-    controller is redirected to the read-only shim, both by name on
-    PATH and through the STATUSCTL pointer, so the ordinary ways of
-    reaching it land somewhere that cannot write. The session marker
-    is added so a nested autopilot refuses to start at all.
+    Two things are removed and one is added. Orchestrator
+    configuration goes, so a worker cannot read the settings that
+    constrain it or relaunch an orchestrator with a worker of its
+    choosing. The controller is redirected to the read-only shim, both
+    by name on PATH and through the STATUSCTL pointer, so the ordinary
+    ways of reaching it land somewhere that cannot write. The session
+    marker is added so a nested orchestrator refuses to start at all.
     """
 
     environment = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith("AUTOPILOT_")
+        if not key.startswith(
+            WORKER_STRIPPED_ENVIRONMENT_PREFIXES
+        )
     }
 
     directory = str(Path(shim).parent)
@@ -1083,14 +1533,58 @@ def worker_environment(shim):
     return environment
 
 
+def write_worker_schema(directory):
+    """
+    Write the response schema into a directory and return its path.
+
+    One writer, so the file a cycle describes and the file an argument
+    is derived from cannot be two different documents.
+    """
+
+    schema = (
+        Path(directory)
+        / WORKER_RESPONSE_SCHEMA_FILENAME
+    )
+
+    schema.write_text(
+        json.dumps(
+            worker_response_schema(),
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+    return schema
+
+
+@contextmanager
+def worker_schema_file():
+    """
+    A schema file on disk for the lifetime of one caller.
+
+    The supervisor preflights the command its cycles will run, and
+    building that command needs the same schema a cycle would have.
+    Materializing it here means the preflighted argv is produced by
+    exactly the path a cycle takes, rather than by a stand-in that
+    could stay valid while the real one broke.
+    """
+
+    with tempfile.TemporaryDirectory(
+        prefix="autopilot-schema-",
+    ) as directory:
+        yield write_worker_schema(directory)
+
+
 @contextmanager
 def worker_session():
     """
-    Provide a read-only controller and the environment that uses it.
+    Provide a read-only controller, the response schema, and the
+    environment that uses them.
 
-    The shim lives outside the repository for the duration of one
+    Both files live outside the repository for the duration of one
     worker invocation, so nothing is left behind that a later process
-    could resolve `statusctl` to by accident.
+    could resolve `statusctl` to by accident, and no schema artifact
+    ever lands in the worktree the completion check inspects.
     """
 
     with tempfile.TemporaryDirectory(
@@ -1108,27 +1602,59 @@ def worker_session():
 
         shim.chmod(0o755)
 
-        yield worker_environment(shim)
+        schema = write_worker_schema(directory)
 
-
-def invoke_worker(runtime, timeout):
-    argv = [
-        *worker_argv(),
-        build_brief(runtime),
-    ]
-
-    try:
-        assert_worker_command_allowed(argv)
-
-    except ForbiddenCommand as error:
-        raise refused(
-            f"Worker command refused by the guard: {error}"
+        yield (
+            worker_environment(shim),
+            schema,
         )
+
+
+def invoke_worker(
+    runtime,
+    timeout,
+    brief=None,
+    session_id=None,
+    observer=None,
+):
+    """
+    Run one worker invocation and return its structured outcome.
+
+    Three optional seams exist for the supervisor, and each is
+    deliberately narrow so that one implementation of the worker
+    posture serves both orchestrators. `brief` replaces the phase
+    description, which is how reviewer feedback and an auto-decision
+    reach the session. `session_id` names a fresh session. `observer`
+    is handed the completed process the moment it returns, before its
+    exit status is judged, so a failed invocation can still be
+    recorded — an artifact written only for successes would be missing
+    exactly the cycles worth reading.
+    """
 
     started = time.monotonic()
 
     try:
-        with worker_session() as environment:
+        with worker_session() as (
+            environment,
+            schema,
+        ):
+            argv = [
+                *worker_argv(
+                    schema,
+                    session_id,
+                ),
+                brief or build_brief(runtime),
+            ]
+
+            try:
+                assert_worker_command_allowed(argv)
+
+            except ForbiddenCommand as error:
+                raise refused(
+                    "Worker command refused by the guard: "
+                    f"{error}"
+                )
+
             completed = run_guarded(
                 argv,
                 timeout=timeout,
@@ -1141,24 +1667,34 @@ def invoke_worker(runtime, timeout):
             f"{runtime.get('phase')}."
         )
 
-    except FileNotFoundError:
+    except FileNotFoundError as error:
         raise blocked(
-            f"Worker command not found: {argv[0]}"
+            "Worker command not found: "
+            + str(error.filename or "the worker command")
         )
 
-    except PermissionError:
+    except PermissionError as error:
         raise refused(
-            f"Worker command is not executable: {argv[0]}"
+            "Worker command is not executable: "
+            + str(error.filename or "the worker command")
         )
 
     elapsed = time.monotonic() - started
+
+    if observer is not None:
+        observer(completed, elapsed)
 
     if completed.returncode != 0:
         raise blocked(
             "Worker exited "
             f"{completed.returncode} in phase "
             f"{runtime.get('phase')} after {elapsed:.1f}s.",
-            worker_stderr_tail=completed.stderr[-500:],
+            worker_stdout_tail=(
+                completed.stdout[-WORKER_TAIL_LIMIT:]
+            ),
+            worker_stderr_tail=(
+                completed.stderr[-WORKER_TAIL_LIMIT:]
+            ),
         )
 
     return parse_worker_response(completed.stdout)

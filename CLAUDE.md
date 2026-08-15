@@ -1102,6 +1102,141 @@ Neither mechanism replaces the other.
 
 ---
 
+## 23A. Unattended orchestration
+
+Unattended operation is performed by three programs with three
+different authorities:
+
+    .claude/bin/autopilot         the deterministic orchestrator
+    .claude/bin/supervisor        autopilot plus review and
+                                  bounded decision autonomy
+    .claude/bin/openai_reviewer   the independent external reviewer
+
+These are OPERATOR-RUN programs. Claude must never invoke them, and
+`.claude/settings.json` denies them to a Claude session. A worker that
+could start an orchestrator would be handing itself back every
+authority the worker session exists to withhold.
+
+### Roles
+
+The supervisor decides which phase runs next from durable runtime
+state and drives every transition through `statusctl`.
+
+The worker is one non-interactive Claude session. It performs exactly
+one phase and returns one structured outcome. Its session resolves
+`statusctl` to a read-only shim, so it can neither move the lifecycle
+nor record its own evidence, and its answer is never trusted as proof
+that anything happened.
+
+The reviewer is read-only. It receives the worker results, the diff,
+test evidence, task and phase context and the relevant contract
+extract, and it returns one verdict. It never writes a file, never
+runs Git, never touches runtime state, and never resolves a gate.
+
+### Supervisor lifecycle
+
+The supervisor reports exactly four external states:
+
+    RUNNING             work remains and the cycle budget ended
+    WAITING_FOR_HUMAN   a canonical Human Gate is open
+    READY               the task reached READY_FOR_HUMAN_REVIEW
+    FAILED              the run could not continue
+
+`FAILED` here is the supervisor's own external state. It is not
+`statusctl fail`: a technical stop leaves the task RUNNING, because
+recording a task as FAILED is a judgement about the work rather than
+about the run.
+
+`WAITING_FOR_HUMAN` belongs to a canonical human decision boundary
+recorded in runtime state. There are exactly three such boundaries:
+
+    1. an open canonical Human Gate — opened through `statusctl`,
+       with runtime state `BLOCKED_HUMAN_DECISION`;
+    2. a Work Task already at `READY_FOR_HUMAN_REVIEW`, awaiting the
+       human review that state exists to ask for;
+    3. an Integration Task carrying a `DECLARED` integration action,
+       awaiting the human authorization that action requires.
+
+That list says what the state means; it does not add orchestrator
+outputs. Only the first is a boundary the supervisor stops at under
+that name. The second it reports as `READY`, which is the same
+boundary named in the word the lifecycle already uses for it, and the
+third it reaches by opening the gate that action needs, which is the
+first boundary again.
+
+Everything else is a fault in the run. An external review that cannot
+be performed — a reviewer that is absent, unreachable,
+unauthenticated, unbilled, timed out or unparseable — is `FAILED`, as
+is every other technical stop: they open no gate, leave runtime state
+RUNNING, and give a human nothing to resolve, so naming any of them
+`WAITING_FOR_HUMAN` would announce a decision that does not exist.
+Exit codes stay distinct, so the reason for the stop is never lost.
+
+### Decision Autonomy Policy
+
+A technical or operational choice inside approved scope is decided by
+the supervisor, not by asking. The recommended option is taken, or
+absent one the safest compliant option, and the choice is recorded as
+an `AUTO_DECISION` carrying its id, question, options considered,
+choice, rationale and timestamp. The run continues.
+
+A worker response that is a plain-text question, or that offers a
+choice without a valid `gate_type`, is an INVALID interactive
+response. The supervisor re-asks exactly once, then fails closed. An
+unclear answer is never read as success.
+
+Gate-worthiness itself is unchanged. The gate triggers in section 11
+and the valid gate types are the same as for any other work, and an
+`AUTO_DECISION` may only settle a choice that triggers no gate.
+
+### External review
+
+`EXTERNAL_REVIEW` is performed by the reviewer bridge. The verdict is
+one of:
+
+    APPROVE                  the work stands; the run continues
+    REQUEST_CHANGES          at least one ACCEPT finding is carried
+                             into CORRECT_EXTERNAL_FINDINGS
+    HUMAN_DECISION_REQUIRED  a canonical Human Gate is opened and the
+                             run stops
+
+A reviewer that is absent, unreachable or unparseable stops the run,
+and that stop is reported as `FAILED`. It is never treated as an
+approval, and a reviewer may never propose a `GIT_INTEGRATION` gate.
+
+### Cycle artifacts
+
+One artifact is written per invocation, including failures, to:
+
+    .claude/var/supervisor/cycles/<cycle_id>.json
+
+Nothing is written to `.claude/runtime/`, which holds only
+`status.json`, `audit.jsonl` and `latest_report.md`. Artifacts carry
+bounded stdout and stderr tails and never carry credentials.
+
+### Integration test disposition
+
+An Integration Task never re-tests product code, so the supervisor may
+record `NOT_REQUIRED` for an empty test slot — but only on proof, and
+never by task kind alone. Every condition must hold:
+
+- the current task is INTEGRATION with a non-empty `parent_task_id`;
+- `audit.jsonl` records a `TASK_READY_FOR_HUMAN_REVIEW` event for
+  exactly that parent;
+- that event records `task_kind` WORK, explicitly, and an event
+  carrying no `task_kind` at all is refused rather than assumed;
+- that event records `targeted_result` PASS and `full_result` PASS.
+
+A parent whose own results were `NOT_REQUIRED` is not sufficient,
+which is what stops one Integration Task from inheriting another's
+exemption. An existing test result is never overwritten; only an empty
+slot is filled. Absent or inconsistent evidence fails closed.
+
+A Work Task never takes this path, and no orchestrator may record
+`NOT_REQUIRED` for one.
+
+---
+
 ## 24. Concurrent-session behavior
 
 Multiple Claude Remote Control sessions may exist concurrently.

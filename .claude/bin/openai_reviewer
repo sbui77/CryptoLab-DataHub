@@ -1,0 +1,1107 @@
+#!/usr/bin/env python3
+
+"""
+Hardening 4.3 — OpenAI reviewer bridge.
+
+EXTERNAL_REVIEW is the one phase the worker may not perform on its own
+behalf: a session reviewing its own work is not an independent review.
+This bridge is that independent reviewer, and it is deliberately the
+least privileged component in the control plane.
+
+It can do exactly one thing: turn a description of finished work into a
+structured verdict.
+
+    it never writes a file;
+    it never runs git;
+    it never touches runtime state;
+    it never opens a Human Gate and never resolves one;
+    it reads OPENAI_API_KEY from the environment, never logs it, and
+      never returns it in an error;
+    it fails closed — an unreachable API, an unparseable answer or a
+      verdict that breaks its own contract is an error, never an
+      implicit APPROVE.
+
+The HTTP call is behind an injectable transport so the whole verdict
+loop — APPROVE, REQUEST_CHANGES and HUMAN_DECISION_REQUIRED — is
+testable without credentials or a network. The real transport speaks
+the OpenAI Responses API over `requests`, which requirements.txt
+already declares, so no dependency is installed for this bridge.
+
+The verdict is advice. Acting on it is the supervisor's job, and only
+a human may resolve any gate the advice leads to.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+
+# ================================================================
+# EXIT CODES
+# ================================================================
+#
+# Shared with the orchestrators so a caller can tell a configuration
+# refusal from a reviewer that ran and failed.
+
+EXIT_OK = 0
+EXIT_REFUSED = 11
+EXIT_ERROR = 12
+
+
+# ================================================================
+# CONFIGURATION
+# ================================================================
+
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
+
+DEFAULT_MODEL = "gpt-5"
+
+DEFAULT_TIMEOUT_SECONDS = 300.0
+
+API_KEY_VARIABLE = "OPENAI_API_KEY"
+
+RESPONSE_FORMAT_NAME = "external_review_verdict"
+
+
+class ReviewerError(RuntimeError):
+    """
+    Raised for every reviewer failure.
+
+    One exception type, because every failure here has the same
+    consequence: no verdict was produced, and the caller must not
+    proceed as though one was.
+    """
+
+
+class Config:
+    """
+    Reviewer configuration, resolved from the environment.
+
+    `api_key` is held only to build the Authorization header. It is
+    never printed, never returned in an error, and never written into
+    an artifact; `describe()` reports its presence and nothing more.
+    """
+
+    def __init__(
+        self,
+        api_key,
+        model,
+        base_url,
+        timeout,
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    @classmethod
+    def from_environment(cls, environ=None):
+        environ = (
+            os.environ
+            if environ is None
+            else environ
+        )
+
+        raw_timeout = environ.get(
+            "OPENAI_REVIEW_TIMEOUT",
+            "",
+        ).strip()
+
+        if raw_timeout:
+            try:
+                timeout = float(raw_timeout)
+
+            except ValueError:
+                raise ReviewerError(
+                    "OPENAI_REVIEW_TIMEOUT must be a number, got "
+                    f"{raw_timeout!r}."
+                )
+
+            if timeout <= 0:
+                raise ReviewerError(
+                    "OPENAI_REVIEW_TIMEOUT must be greater than "
+                    f"zero, got {raw_timeout!r}."
+                )
+
+        else:
+            timeout = DEFAULT_TIMEOUT_SECONDS
+
+        return cls(
+            api_key=environ.get(
+                API_KEY_VARIABLE,
+                "",
+            ).strip(),
+            model=environ.get(
+                "OPENAI_REVIEW_MODEL",
+                "",
+            ).strip()
+            or DEFAULT_MODEL,
+            base_url=environ.get(
+                "OPENAI_BASE_URL",
+                "",
+            ).strip()
+            or DEFAULT_BASE_URL,
+            timeout=timeout,
+        )
+
+    def require_api_key(self):
+        """
+        Fail closed when the reviewer is not configured.
+
+        An unconfigured reviewer must stop the run, not silently
+        approve it, so the absence of a key is an error rather than a
+        skip.
+        """
+
+        if not self.api_key:
+            raise ReviewerError(
+                f"{API_KEY_VARIABLE} is not set, so no independent "
+                "review can be performed. EXTERNAL_REVIEW is not "
+                "skipped on a missing reviewer; configure the key or "
+                "have the review performed another way."
+            )
+
+        return self.api_key
+
+    def describe(self):
+        return {
+            "model": self.model,
+            "base_url": self.base_url,
+            "timeout": self.timeout,
+            "api_key_present": bool(self.api_key),
+            "api_key_variable": API_KEY_VARIABLE,
+        }
+
+
+def redact(text, secret):
+    """
+    Remove a secret from text that is about to be surfaced.
+
+    Error bodies are echoed to help an operator diagnose a failure,
+    and an API that reflects a request header back would otherwise put
+    the key into a log, an artifact, or a report. Redaction is applied
+    at the boundary rather than trusted to never be needed.
+    """
+
+    if not secret:
+        return text
+
+    return str(text).replace(
+        secret,
+        "[REDACTED]",
+    )
+
+
+# ================================================================
+# VERDICT CONTRACT
+# ================================================================
+#
+# The reviewer's answer is machine-consumed, so its shape is pinned
+# twice: once as the schema handed to the API, and once as the
+# validation below, which does not trust the model to have honoured
+# it. The second check is the one that decides.
+
+VERDICTS = (
+    "APPROVE",
+    "REQUEST_CHANGES",
+    "HUMAN_DECISION_REQUIRED",
+)
+
+# Mirrors CLAUDE.md section 12. A reviewer classifies; it does not
+# decide what happens next.
+CLASSIFICATIONS = (
+    "ACCEPT",
+    "REJECT",
+    "DISCUSS",
+)
+
+# Gate types the reviewer may propose. GIT_INTEGRATION is deliberately
+# absent: an integration boundary belongs to a declared Integration
+# Task scope, and a reviewer that could name one would be proposing an
+# authorization it has no standing to request.
+PROPOSABLE_GATE_TYPES = (
+    "ARCHITECTURE_DECISION",
+    "DATA_MUTATION",
+    "DEPENDENCY_CHANGE",
+    "OS_CHANGE",
+    "OTHER",
+    "SCOPE_EXPANSION",
+    "SECURITY_AUTH",
+    "SEMANTIC_DECISION",
+    "UNRESOLVED_DISCUSS",
+)
+
+MAX_FINDINGS = 50
+
+# Keywords whose values are data rather than nested schemas. Walking
+# into them would read an enum's members, or a description's prose, as
+# objects to validate.
+STRICT_SCHEMA_LEAF_KEYS = {
+    "const",
+    "description",
+    "enum",
+    "required",
+    "type",
+}
+
+
+def strict_schema_violations(schema, path=()):
+    """
+    Every place a schema leaves the strict Structured Outputs subset.
+
+    Recursive and exhaustive, unlike the provider, which reports one
+    path per call. A local check that stopped at the first violation
+    would turn a schema with three faults into three rejected reviews,
+    each discovered a network round trip and a run apart.
+    """
+
+    violations = []
+
+    if isinstance(schema, list):
+        for index, entry in enumerate(schema):
+            violations.extend(
+                strict_schema_violations(
+                    entry,
+                    path + (index,),
+                )
+            )
+
+        return violations
+
+    if not isinstance(schema, dict):
+        return violations
+
+    properties = schema.get("properties")
+
+    if isinstance(properties, dict):
+        required = schema.get("required")
+
+        if not isinstance(required, list):
+            violations.append(
+                f"in {path}, 'required' is missing."
+            )
+
+        else:
+            missing = [
+                key
+                for key in properties
+                if key not in required
+            ]
+
+            if missing:
+                violations.append(
+                    f"in {path}, 'required' must include every key "
+                    "in properties. Missing "
+                    + ", ".join(
+                        repr(key)
+                        for key in missing
+                    )
+                    + "."
+                )
+
+            unknown = [
+                key
+                for key in required
+                if key not in properties
+            ]
+
+            if unknown:
+                violations.append(
+                    f"in {path}, 'required' names "
+                    + ", ".join(
+                        repr(key)
+                        for key in unknown
+                    )
+                    + ", which is not a property."
+                )
+
+        if schema.get("additionalProperties") is not False:
+            violations.append(
+                f"in {path}, 'additionalProperties' must be false."
+            )
+
+    for key, value in schema.items():
+        if key in STRICT_SCHEMA_LEAF_KEYS:
+            continue
+
+        violations.extend(
+            strict_schema_violations(
+                value,
+                path + (key,),
+            )
+        )
+
+    return violations
+
+
+def assert_strict_schema(schema):
+    """
+    Refuse to submit a schema the provider will refuse.
+
+    The rejection is otherwise learned from the API, after a round
+    trip, in a phase the run has already committed to — and it arrives
+    one violation at a time. Checking the body locally costs nothing
+    and fails closed: the review does not happen, and a review that
+    did not happen is never an approval.
+    """
+
+    violations = strict_schema_violations(schema)
+
+    if violations:
+        raise ReviewerError(
+            "The response schema is not valid for strict Structured "
+            "Outputs, so it was not submitted: "
+            + " ".join(violations)
+        )
+
+
+def strict_object(properties):
+    """
+    An object schema in the strict Structured Outputs subset.
+
+    That subset has no optional property: every object must list every
+    one of its keys in `required` and must forbid additional ones. So
+    `required` is derived from `properties` here rather than written
+    out beside it — the two lists drifting apart is precisely the
+    failure this exists to make unrepresentable, and it is a failure
+    the provider reports one key at a time, on a call that never
+    reaches the model.
+
+    Optionality is expressed in the type instead: a field that may
+    have no value admits null. Requiring a key is not the same as
+    demanding an answer for it.
+    """
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": list(properties),
+        "properties": properties,
+    }
+
+
+def verdict_schema():
+    """
+    The JSON Schema handed to the Responses API.
+
+    Every field is required, because strict Structured Outputs admits
+    nothing else. The ones an ordinary APPROVE has no answer for —
+    findings, the gate fields, alternatives, risks — are nullable, so
+    a reviewer with nothing to report says null rather than inventing
+    a value to satisfy the shape.
+
+    The conditional rules are unchanged and still live in
+    validate_verdict, which is what the supervisor actually acts on: a
+    verdict that names a gate without a question is a schema-valid
+    answer and still not a usable review.
+    """
+
+    return strict_object(
+        {
+            "verdict": {
+                "type": "string",
+                "enum": list(VERDICTS),
+                "description": (
+                    "APPROVE when the work is sound; "
+                    "REQUEST_CHANGES when a defect must be fixed "
+                    "before completion; HUMAN_DECISION_REQUIRED "
+                    "when the answer needs human authority."
+                ),
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "one paragraph stating the verdict and why"
+                ),
+            },
+            "findings": {
+                "type": [
+                    "array",
+                    "null",
+                ],
+                "items": strict_object(
+                    {
+                        "classification": {
+                            "type": "string",
+                            "enum": list(CLASSIFICATIONS),
+                        },
+                        "detail": {
+                            "type": "string",
+                        },
+                        "location": {
+                            "type": [
+                                "string",
+                                "null",
+                            ],
+                            "description": (
+                                "file and line where the finding "
+                                "is, or null when it is not tied "
+                                "to one place"
+                            ),
+                        },
+                    }
+                ),
+            },
+            "gate_type": {
+                "type": [
+                    "string",
+                    "null",
+                ],
+                "enum": [
+                    *PROPOSABLE_GATE_TYPES,
+                    None,
+                ],
+            },
+            "question": {
+                "type": [
+                    "string",
+                    "null",
+                ],
+            },
+            "recommendation": {
+                "type": [
+                    "string",
+                    "null",
+                ],
+            },
+            "alternatives": {
+                "type": [
+                    "array",
+                    "null",
+                ],
+                "items": {
+                    "type": "string",
+                },
+            },
+            "risks": {
+                "type": [
+                    "array",
+                    "null",
+                ],
+                "items": {
+                    "type": "string",
+                },
+            },
+        }
+    )
+
+
+def string_list(value, field):
+    if value is None:
+        return []
+
+    if not isinstance(value, list):
+        raise ReviewerError(
+            f"Reviewer verdict field {field!r} must be a list of "
+            "strings."
+        )
+
+    return [
+        str(entry).strip()
+        for entry in value
+        if str(entry).strip()
+    ]
+
+
+def validated_findings(value):
+    if value is None:
+        return []
+
+    if not isinstance(value, list):
+        raise ReviewerError(
+            "Reviewer verdict field 'findings' must be a list."
+        )
+
+    if len(value) > MAX_FINDINGS:
+        raise ReviewerError(
+            "Reviewer returned "
+            f"{len(value)} findings, more than the {MAX_FINDINGS} "
+            "this bridge will carry."
+        )
+
+    findings = []
+
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ReviewerError(
+                "Each reviewer finding must be an object with a "
+                "classification and a detail."
+            )
+
+        classification = str(
+            entry.get("classification") or ""
+        ).strip().upper()
+
+        if classification not in CLASSIFICATIONS:
+            raise ReviewerError(
+                "Reviewer finding carries an invalid "
+                f"classification: {classification!r}. Valid values "
+                "are "
+                + ", ".join(CLASSIFICATIONS)
+                + "."
+            )
+
+        detail = str(
+            entry.get("detail") or ""
+        ).strip()
+
+        if not detail:
+            raise ReviewerError(
+                "Reviewer finding carries no detail, so there is "
+                "nothing to act on."
+            )
+
+        location = entry.get("location")
+
+        findings.append(
+            {
+                "classification": classification,
+                "detail": detail,
+                "location": (
+                    str(location).strip()
+                    if location
+                    else None
+                ),
+            }
+        )
+
+    return findings
+
+
+def validate_verdict(candidate):
+    """
+    Hold the model's answer to the reviewer contract.
+
+    The API is asked for a schema-validated object, and this checks it
+    again anyway. A schema the provider enforces is only as good as the
+    provider enforcing it, and the cost of trusting an unchecked
+    verdict is a run that advances on advice nobody gave.
+    """
+
+    if not isinstance(candidate, dict):
+        raise ReviewerError(
+            "Reviewer returned a "
+            f"{type(candidate).__name__}, not a verdict object."
+        )
+
+    verdict = str(
+        candidate.get("verdict") or ""
+    ).strip().upper()
+
+    if verdict not in VERDICTS:
+        raise ReviewerError(
+            f"Reviewer returned an unknown verdict: {verdict!r}. "
+            "Valid values are "
+            + ", ".join(VERDICTS)
+            + "."
+        )
+
+    summary = str(
+        candidate.get("summary") or ""
+    ).strip()
+
+    if not summary:
+        raise ReviewerError(
+            "Reviewer returned a verdict with no summary."
+        )
+
+    findings = validated_findings(
+        candidate.get("findings")
+    )
+
+    gate_type = candidate.get("gate_type")
+
+    gate_type = (
+        str(gate_type).strip().upper()
+        if gate_type
+        else None
+    )
+
+    question = str(
+        candidate.get("question") or ""
+    ).strip()
+
+    recommendation = str(
+        candidate.get("recommendation") or ""
+    ).strip()
+
+    if verdict == "REQUEST_CHANGES":
+        actionable = [
+            finding
+            for finding in findings
+            if finding["classification"] == "ACCEPT"
+        ]
+
+        if not actionable:
+            raise ReviewerError(
+                "Reviewer requested changes without naming an "
+                "ACCEPT finding. A change request that identifies no "
+                "defect gives the worker nothing to correct."
+            )
+
+    if verdict == "HUMAN_DECISION_REQUIRED":
+        if gate_type not in PROPOSABLE_GATE_TYPES:
+            raise ReviewerError(
+                "Reviewer requires a human decision but proposed "
+                f"gate_type {gate_type!r}. It must be one of "
+                + ", ".join(PROPOSABLE_GATE_TYPES)
+                + "."
+            )
+
+        if not question or not recommendation:
+            raise ReviewerError(
+                "Reviewer requires a human decision but supplied no "
+                "question and recommendation, which a Human Gate "
+                "cannot be opened without."
+            )
+
+    elif gate_type is not None:
+        raise ReviewerError(
+            f"Reviewer proposed gate_type {gate_type!r} on a "
+            f"{verdict} verdict. A gate is only meaningful when a "
+            "human decision is actually required."
+        )
+
+    return {
+        "verdict": verdict,
+        "summary": summary,
+        "findings": findings,
+        "gate_type": gate_type,
+        "question": question or None,
+        "recommendation": recommendation or None,
+        "alternatives": string_list(
+            candidate.get("alternatives"),
+            "alternatives",
+        ),
+        "risks": string_list(
+            candidate.get("risks"),
+            "risks",
+        ),
+    }
+
+
+# ================================================================
+# REQUEST
+# ================================================================
+
+REVIEW_INSTRUCTIONS = """
+You are the independent external reviewer for the CryptoLab DataHub
+control plane. The work below was performed by a different agent under
+the operating contract in CLAUDE.md, and your review is the one part of
+that contract its author may not perform for itself.
+
+Review the work as an adversary would: try to falsify it. Judge only
+what the evidence shows. Absent evidence is a finding, never an
+assumption in the work's favour.
+
+Classify each finding exactly as the contract does:
+
+    ACCEPT   a genuine defect that must be corrected;
+    REJECT   a suspected issue you disproved, with the evidence;
+    DISCUSS  a semantic, architectural, scope, security, data,
+             dependency or risk decision that needs human authority.
+
+Then choose one verdict:
+
+    APPROVE                  the work is sound as it stands;
+    REQUEST_CHANGES          at least one ACCEPT finding must be
+                             fixed before completion;
+    HUMAN_DECISION_REQUIRED  a DISCUSS-class decision blocks
+                             completion; supply gate_type, question
+                             and recommendation.
+
+Your reply carries every field of the response schema. A field you
+have no answer for is null — an empty list for findings, alternatives
+and risks is equally acceptable. Never invent a value to fill a field:
+a fabricated finding or an unasked-for gate is worse than saying
+nothing, and null is how the schema lets you say nothing.
+
+The work may carry `last_gate_decision`, the most recent Human Gate a
+human resolved on this task. Read it before you choose
+HUMAN_DECISION_REQUIRED. A review resumes on the same phase a gate
+stopped it at, so the evidence in front of you is the evidence that
+produced that decision, and asking the settled question again is a
+loop the human has to keep answering with nothing changing between
+rounds. If the recorded decision disposes of your concern, say so as a
+REJECT finding citing the gate id and move on. Raise a gate only for a
+decision that record does not answer, and say plainly what it leaves
+open.
+
+You are advisory. You do not resolve Human Gates, you do not authorize
+git integration, and you never propose a GIT_INTEGRATION gate: an
+integration boundary belongs to a declared Integration Task scope and
+to the human who approves it.
+""".strip()
+
+
+def build_request(payload, config):
+    """
+    Assemble the Responses API call.
+
+    The work under review is passed as one JSON input string rather
+    than interpolated into prose, so nothing in the diff or the worker
+    summary can be read as instruction.
+    """
+
+    if not isinstance(payload, dict):
+        raise ReviewerError(
+            "The review payload must be an object describing the "
+            "work under review."
+        )
+
+    api_key = config.require_api_key()
+
+    url = f"{config.base_url}/responses"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    body = {
+        "model": config.model,
+        "instructions": REVIEW_INSTRUCTIONS,
+        "input": json.dumps(
+            payload,
+            sort_keys=True,
+        ),
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": RESPONSE_FORMAT_NAME,
+                "strict": True,
+                "schema": verdict_schema(),
+            },
+        },
+    }
+
+    # Validated on the assembled body rather than on verdict_schema(),
+    # because the body is the artifact the provider judges. The two
+    # were the same object the last time this was believed obvious,
+    # and a check aimed at the builder cannot see a substituted or
+    # stale schema arriving by any other route.
+    assert_strict_schema(
+        body["text"]["format"]["schema"]
+    )
+
+    return url, headers, body
+
+
+# ================================================================
+# RESPONSE
+# ================================================================
+
+
+def extract_output_text(document):
+    """
+    Recover the model's message from a Responses API document.
+
+    `output_text` is the convenience field and is preferred when
+    present. The structured walk is the fallback, because a response
+    that carries the message only in `output[].content[].text` is still
+    a perfectly valid response.
+    """
+
+    if not isinstance(document, dict):
+        raise ReviewerError(
+            "Reviewer API returned a "
+            f"{type(document).__name__}, not a response object."
+        )
+
+    direct = document.get("output_text")
+
+    if isinstance(direct, str) and direct.strip():
+        return direct
+
+    if isinstance(direct, list):
+        joined = "".join(
+            entry
+            for entry in direct
+            if isinstance(entry, str)
+        )
+
+        if joined.strip():
+            return joined
+
+    chunks = []
+
+    for item in document.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+
+        for part in item.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+
+            text = part.get("text")
+
+            if isinstance(text, str):
+                chunks.append(text)
+
+    joined = "".join(chunks)
+
+    if not joined.strip():
+        raise ReviewerError(
+            "Reviewer API returned no message text, so there is no "
+            "verdict to read."
+        )
+
+    return joined
+
+
+def parse_response(status, text, config):
+    """
+    Turn an HTTP result into a validated verdict, failing closed.
+
+    A non-2xx status, an unparseable body and a verdict that breaks
+    the contract are all the same outcome: no review happened.
+    """
+
+    secret = config.api_key
+
+    if status < 200 or status >= 300:
+        raise ReviewerError(
+            f"Reviewer API returned HTTP {status}: "
+            + redact(
+                str(text)[:1000],
+                secret,
+            )
+        )
+
+    try:
+        document = json.loads(text)
+
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ReviewerError(
+            "Reviewer API returned an unparseable body: "
+            + redact(
+                str(error),
+                secret,
+            )
+        )
+
+    message = extract_output_text(document)
+
+    try:
+        candidate = json.loads(message)
+
+    except json.JSONDecodeError as error:
+        raise ReviewerError(
+            "Reviewer returned a message that is not JSON: "
+            + redact(
+                str(error),
+                secret,
+            )
+        )
+
+    return validate_verdict(candidate)
+
+
+# ================================================================
+# TRANSPORT
+# ================================================================
+#
+# The seam that makes this bridge testable. A transport is any
+# callable taking (url, headers, body, timeout) and returning
+# (status_code, body_text); nothing above this line knows how the
+# bytes move.
+
+
+def requests_transport(url, headers, body, timeout):
+    """
+    The real transport: the OpenAI Responses API over `requests`.
+
+    `requests` is imported here rather than at module scope so that a
+    unit test with an injected transport never depends on it being
+    installed, and so a missing dependency reports what to do instead
+    of failing at import.
+    """
+
+    try:
+        import requests
+
+    except ImportError:
+        raise ReviewerError(
+            "The `requests` package is required for the real "
+            "reviewer transport. It is already declared in "
+            "requirements.txt; install project dependencies rather "
+            "than adding a new one."
+        )
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=timeout,
+        )
+
+    except Exception as error:
+        # requests raises a family of connection, timeout and TLS
+        # errors. They all mean the same thing here, and the message
+        # is redacted because a proxy error can echo the request.
+        raise ReviewerError(
+            "Reviewer API call failed: "
+            + redact(
+                f"{type(error).__name__}: {error}",
+                headers.get(
+                    "Authorization",
+                    "",
+                ).removeprefix("Bearer "),
+            )
+        )
+
+    return response.status_code, response.text
+
+
+def review(payload, transport=None, config=None):
+    """
+    Produce one independent verdict for one piece of finished work.
+
+    This is the whole public surface. The caller supplies what was
+    done; the reviewer says what it thinks; nobody's state changes.
+    """
+
+    config = (
+        Config.from_environment()
+        if config is None
+        else config
+    )
+
+    transport = (
+        requests_transport
+        if transport is None
+        else transport
+    )
+
+    url, headers, body = build_request(
+        payload,
+        config,
+    )
+
+    try:
+        status, text = transport(
+            url,
+            headers,
+            body,
+            config.timeout,
+        )
+
+    except ReviewerError:
+        raise
+
+    except Exception as error:
+        raise ReviewerError(
+            "Reviewer transport failed: "
+            + redact(
+                f"{type(error).__name__}: {error}",
+                config.api_key,
+            )
+        )
+
+    return parse_response(
+        status,
+        text,
+        config,
+    )
+
+
+# ================================================================
+# COMMANDS
+# ================================================================
+
+
+def cmd_review(args):
+    path = Path(args.payload)
+
+    try:
+        raw = path.read_text()
+
+    except OSError as error:
+        raise ReviewerError(
+            f"Cannot read the review payload at {path}: {error}"
+        )
+
+    try:
+        payload = json.loads(raw)
+
+    except json.JSONDecodeError as error:
+        raise ReviewerError(
+            f"Review payload at {path} is not valid JSON: {error}"
+        )
+
+    verdict = review(payload)
+
+    print(
+        json.dumps(
+            verdict,
+            sort_keys=True,
+        )
+    )
+
+    return EXIT_OK
+
+
+def cmd_config(_):
+    """
+    Report how the reviewer is configured, secrets excluded.
+
+    Presence of the key is reported; the key itself never is.
+    """
+
+    print(
+        json.dumps(
+            Config.from_environment().describe(),
+            sort_keys=True,
+        )
+    )
+
+    return EXIT_OK
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "CryptoLab external reviewer bridge: one independent "
+            "verdict on finished work, read-only."
+        )
+    )
+
+    sub = parser.add_subparsers(
+        dest="cmd",
+        required=True,
+    )
+
+    command = sub.add_parser("review")
+
+    command.add_argument(
+        "payload",
+        help=(
+            "path to a JSON file describing the work under review"
+        ),
+    )
+
+    command.set_defaults(func=cmd_review)
+
+    command = sub.add_parser("config")
+    command.set_defaults(func=cmd_config)
+
+    args = parser.parse_args()
+
+    try:
+        raise SystemExit(
+            args.func(args)
+        )
+
+    except ReviewerError as error:
+        sys.stderr.write(f"openai_reviewer: {error}\n")
+
+        raise SystemExit(EXIT_ERROR)
+
+
+if __name__ == "__main__":
+    main()

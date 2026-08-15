@@ -221,3 +221,9 @@ __marimo__/
 # Policy, schemas, templates and statusctl remain tracked.
 # Task state, audit history and generated reports are machine-local runtime data.
 .claude/runtime/
+
+# Orchestrator working data: supervisor cycle artifacts and anything else
+# an unattended run writes beside the canonical runtime. Stated explicitly
+# rather than relying on the generic var/ pattern above, which covers this
+# path only by coincidence of name.
+.claude/var/
